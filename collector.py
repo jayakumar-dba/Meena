@@ -11,6 +11,7 @@ import sqlite3
 import requests
 import os
 import html
+from itertools import chain
 from html.parser import HTMLParser
 from datetime import datetime
 from dotenv import load_dotenv
@@ -193,7 +194,8 @@ def _as_url(value):
 def _id_from_url(url, resource):
     if not url:
         return ""
-    m = re.search(rf"/{resource}s?/(\d+)\b", url, re.IGNORECASE)
+    plural = resource if resource.endswith("s") else f"{resource}s"
+    m = re.search(rf"/{plural}/(\d+)\b", url, re.IGNORECASE)
     return m.group(1) if m else ""
 
 
@@ -207,7 +209,7 @@ def _extract_header_application(text):
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
             header_value = _normalize_spaces(m.group(1))
-            service_match = re.match(r"(.+?)\s+service\s+.+", header_value, re.IGNORECASE)
+            service_match = re.match(r"(.+?)\s+service\b", header_value, re.IGNORECASE)
             return _normalize_spaces(service_match.group(1) if service_match else header_value)
     return ""
 
@@ -343,7 +345,7 @@ def parse_message(msg):
     pipeline_id = _find_id(text, ["Pipeline Link", "Pipeline ID", "Pipeline"]) or _id_from_url(pipeline_url, "pipeline")
     job_id = _find_id(text, ["Job Link", "Job ID", "Job"]) or _id_from_url(job_url, "job")
 
-    project_url = _extract_gitlab_project_url([pipeline_url, job_url, karate_url, clue_url, cuke_url] + links)
+    project_url = _extract_gitlab_project_url(chain([pipeline_url, job_url, karate_url, clue_url, cuke_url], links))
     if project_url and pipeline_id and (not pipeline_url or not re.search(r"/-/pipelines/\d+\b", pipeline_url)):
         pipeline_url = f"{project_url}/-/pipelines/{pipeline_id}"
     if project_url and job_id and (not job_url or not re.search(r"/-/jobs/\d+\b$", job_url)):

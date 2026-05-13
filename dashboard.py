@@ -115,7 +115,7 @@ TEMPLATE = """
     .pill-pass { background:#e9f7ef; color:var(--pass); }
     .pill-warn { background:#fff1da; color:var(--warn); }
     .pill-info { background:#e8eeff; color:#2948c6; }
-    .table td { vertical-align:top; white-space: nowrap; }
+    .table td { vertical-align:top; }
     .legend-dot { width:10px; height:10px; border-radius:50%; display:inline-block; margin-right:6px; }
     .btn { border: 1px solid #ccd6ff; border-radius: 8px; background: #fff; color: #2846c8; text-decoration: none; display: inline-block; }
     .btn-sm { font-size: .78rem; padding: .18rem .45rem; }
@@ -211,8 +211,8 @@ TEMPLATE = """
         <div class="trend-row">
           <div class="small text-muted">{{d.date}}</div>
           <div class="trend-bars">
-            <div class="trend-bar-pass" style="width: {{ (d.passed / chart_scale * 100) if chart_scale else 0 }}%;">{{d.passed}}</div>
-            <div class="trend-bar-fail" style="width: {{ (d.failed / chart_scale * 100) if chart_scale else 0 }}%;">{{d.failed}}</div>
+            <div class="trend-bar-pass" aria-label="Passed: {{d.passed}} scenarios" style="width: {{ (d.passed / chart_scale * 100) if chart_scale else 0 }}%;">{{d.passed}}</div>
+            <div class="trend-bar-fail" aria-label="Failed: {{d.failed}} scenarios" style="width: {{ (d.failed / chart_scale * 100) if chart_scale else 0 }}%;">{{d.failed}}</div>
           </div>
         </div>
         {% else %}
@@ -454,7 +454,7 @@ def index():
     """, params)
     chart_data = [{"date": r["date"], "passed": r["passed"], "failed": r["failed"]}
                   for r in chart_rows]
-    chart_scale = max([max(d["passed"] or 0, d["failed"] or 0) for d in chart_data], default=0) or 1
+    chart_scale = max((max(d.get("passed") or 0, d.get("failed") or 0) for d in chart_data), default=1)
 
     failure_rows = query(f"""
         SELECT
