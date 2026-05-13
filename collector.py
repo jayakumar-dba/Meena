@@ -20,6 +20,7 @@ WEBEX_TOKEN = os.getenv("WEBEX_BOT_TOKEN")
 ROOM_ID     = os.getenv("WEBEX_ROOM_ID")
 DB_FILE     = "regression.db"
 HEADERS     = {"Authorization": f"Bearer {WEBEX_TOKEN}"}
+FAILURE_KEYWORDS = r"(fail|error|exception|assert|expected|mismatch|timeout)"
 
 
 # ── Database setup ────────────────────────────────────────────────────────────
@@ -81,10 +82,12 @@ def fetch_messages(max_msgs=100):
 # ── Message parser ────────────────────────────────────────────────────────────
 
 def _normalize_spaces(value):
+    """Normalize whitespace in a string to single spaces and trim ends."""
     return re.sub(r"\s+", " ", (value or "")).strip()
 
 
 def _all_text(msg):
+    """Return combined, plain-text, and markdown text payloads from a Webex message."""
     text = msg.get("text", "") or ""
     markdown = msg.get("markdown", "") or ""
     joined = "\n".join(p for p in [text, markdown] if p)
@@ -92,6 +95,7 @@ def _all_text(msg):
 
 
 def _extract_with_aliases(text, aliases):
+    """Extract a value for the first matching key alias using key-value patterns."""
     for key in aliases:
         patterns = [
             rf"(?:^|[\n|])\s*(?:\*\*)?{re.escape(key)}(?:\*\*)?\s*[:=]\s*([^|\n\r]+)",
@@ -105,6 +109,7 @@ def _extract_with_aliases(text, aliases):
 
 
 def _extract_links(text):
+    """Extract and deduplicate HTTP(S) URLs while removing trailing punctuation."""
     links = []
     for link in re.findall(r"https?://[^\s)>\"]+", text):
         clean = link.rstrip(").,]")
@@ -114,22 +119,24 @@ def _extract_links(text):
 
 
 def _pick_reason(lines, idx):
+    """Pick the nearest failure-like reason line after a feature-file reference."""
     for j in range(idx, min(idx + 8, len(lines))):
         line = _normalize_spaces(lines[j])
         if not line:
             continue
         if ".feature" in line.lower():
             continue
-        if re.search(r"(fail|error|exception|assert|expected|mismatch|timeout)", line, re.IGNORECASE):
+        if re.search(FAILURE_KEYWORDS, line, re.IGNORECASE):
             return line[:500]
     return ""
 
 
 def _extract_failures_from_text(raw_text, source_url):
+    """Parse HTML/text content and extract failure feature, line, and reason details."""
     if not raw_text:
         return []
     text = html.unescape(raw_text)
-    cleaned = re.sub(r"(?is)<script.*?</script>|<style.*?</style>", " ", text)
+    cleaned = re.sub(r"(?is)<script\b[^>]*>.*?</script\s*>|<style\b[^>]*>.*?</style\s*>", " ", text)
     cleaned = re.sub(r"<[^>]+>", "\n", cleaned)
     lines = [_normalize_spaces(l) for l in cleaned.splitlines() if _normalize_spaces(l)]
     blob = "\n".join(lines)
@@ -167,6 +174,7 @@ def _extract_failures_from_text(raw_text, source_url):
 
 
 def extract_failures_for_report(data, msg):
+    """Extract failures from linked reports, falling back to Webex message content."""
     joined_text, _, _ = _all_text(msg)
     links = [u for u in [data.get("karate_url"), data.get("cluecumber_url"), data.get("cucumber_url")] if u]
     failures = []
@@ -176,7 +184,8 @@ def extract_failures_for_report(data, msg):
             resp = requests.get(url, timeout=15)
             if resp.ok:
                 failures.extend(_extract_failures_from_text(resp.text, url))
-        except Exception:
+        except Exception as exc:
+            print(f"⚠️ Could not parse report URL {url}: {exc}")
             continue
 
     if not failures:

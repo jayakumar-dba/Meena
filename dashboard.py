@@ -12,6 +12,9 @@ from datetime import datetime, timedelta
 
 app = Flask(__name__)
 DB_FILE = "regression.db"
+RECURRING_FAILURE_THRESHOLD = 3
+FEATURE_NAME_MAX = 24
+FAILURE_REASON_MAX = 80
 
 
 def query(sql, params=()):
@@ -150,9 +153,10 @@ TEMPLATE = """
         {% for r in recurring %}
         <div class="d-flex justify-content-between align-items-center mb-2">
           <span class="small" title="{{r['failure_reason']}}">
-            {{r['feature_file'][:24]}}{{'…' if r['feature_file'] and r['feature_file']|length>24 else ''}}
+            {{r['feature_file'][:feature_name_max]}}{{'…' if r['feature_file'] and r['feature_file']|length>feature_name_max else ''}}
           </span>
-          <span class="pill pill-fail">{{r['weekly_count']}}x this week</span>
+          <span class="small text-muted ms-2">wk {{r['week_key']}}</span>
+          <span class="pill pill-fail">{{r['weekly_count']}}x in week</span>
         </div>
         {% else %}
         <div class="text-muted small text-center mt-3">🎉 No recurring failures in this range.</div>
@@ -197,7 +201,7 @@ TEMPLATE = """
           <td class="small">{{r['feature_file'] if r['feature_file'] else '—'}}</td>
           <td class="small text-center">{{r['failure_line'] if r['failure_line'] else '—'}}</td>
           <td class="small" title="{{r['failure_reason']}}">
-            {{r['failure_reason'][:80] if r['failure_reason'] else '—'}}{{'…' if r['failure_reason'] and r['failure_reason']|length>80 else ''}}
+            {{r['failure_reason'][:failure_reason_max] if r['failure_reason'] else '—'}}{{'…' if r['failure_reason'] and r['failure_reason']|length>failure_reason_max else ''}}
           </td>
           <td class="small">
             {% if r['karate_url'] %}
@@ -218,7 +222,7 @@ TEMPLATE = """
           </td>
           <td>
             {% if r['weekly_recurrence'] and r['weekly_recurrence'] > 0 %}
-              <span class="pill {{'pill-fail' if r['weekly_recurrence'] >= 3 else 'pill-warn'}}">{{r['weekly_recurrence']}}x</span>
+              <span class="pill {{'pill-fail' if r['weekly_recurrence'] >= recurring_threshold else 'pill-warn'}}">{{r['weekly_recurrence']}}x</span>
             {% else %}
               <span class="pill pill-pass">0</span>
             {% endif %}
@@ -288,14 +292,13 @@ def index():
     avg_pct    = round(sum(r["pass_percent"] for r in kpi_rows) / runs, 1) if runs else 0
 
     recurring = query(f"""
-        SELECT f.feature_file, f.failure_reason, COUNT(*) as weekly_count
+        SELECT strftime('%Y-%W', r.executed_at) as week_key, f.feature_file, f.failure_reason, COUNT(*) as weekly_count
         FROM reports r
         JOIN failures f ON f.report_id = r.id
         WHERE {sql_where}
           AND f.feature_file != ''
           AND f.failure_reason != ''
-          AND strftime('%Y-%W', r.executed_at) = strftime('%Y-%W', 'now')
-        GROUP BY f.feature_file, f.failure_reason
+        GROUP BY week_key, f.feature_file, f.failure_reason
         ORDER BY weekly_count DESC
         LIMIT 6
     """, params)
@@ -354,6 +357,9 @@ def index():
         kpi=dict(runs=runs, passed=passed, failed=failed, avg_pct=avg_pct),
         recurring=recurring,
         chart_data=chart_data,
+        recurring_threshold=RECURRING_FAILURE_THRESHOLD,
+        feature_name_max=FEATURE_NAME_MAX,
+        failure_reason_max=FAILURE_REASON_MAX,
         filters=dict(days=days, app=app_f, env=env_f),
     )
 
