@@ -27,6 +27,22 @@ MAX_FAILURE_REASON_LENGTH = 500
 CONTEXT_WINDOW_BEFORE = 200
 CONTEXT_WINDOW_AFTER = 400
 REPORT_FETCH_TIMEOUT = 15
+JSON_SIDECAR_FETCH_TIMEOUT = 10
+INLINE_FAILURE_PATTERN = re.compile(
+    r"([A-Za-z0-9_./\\-]+\.feature)(?::(\d+))?\s*-\s*(.+)",
+    re.IGNORECASE
+)
+JSON_SIDECAR_CANDIDATE_FILES = [
+    "karate-summary-json.txt",
+    "karate-summary.json",
+    "summary.json",
+    "data.json",
+    "report.json",
+]
+JSON_FEATURE_KEYS = {"feature", "feature_file", "uri", "path", "location", "featureName", "relativePath", "fileName"}
+JSON_SCENARIO_KEYS = {"scenario", "scenario_name", "scenarioName", "name"}
+JSON_LINE_KEYS = {"line", "lineNumber", "failedLine", "errorLine"}
+JSON_REASON_KEYS = {"errorMessage", "failureReason", "reason", "message", "error", "stepErrorMessage", "stackTrace"}
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -116,11 +132,12 @@ def _normalize_spaces(value):
 
 
 def _all_text(msg):
-    """Return combined, plain-text, and markdown text payloads from a Webex message."""
+    """Return combined text payloads from a Webex message (text/markdown/html)."""
     text = msg.get("text", "") or ""
     markdown = msg.get("markdown", "") or ""
-    joined = "\n".join(p for p in [text, markdown] if p)
-    return joined, text, markdown
+    html_payload = msg.get("html", "") or ""
+    joined = "\n".join(p for p in [text, markdown, html_payload] if p)
+    return joined, text, markdown, html_payload
 
 
 def _extract_with_aliases(text, aliases):
@@ -169,7 +186,11 @@ def _extract_failures_from_text(raw_text, source_url):
         cleaned = parser.get_text()
     else:
         cleaned = text
-    lines = [_normalize_spaces(l) for l in cleaned.splitlines() if _normalize_spaces(l)]
+    lines = []
+    for raw_line in cleaned.splitlines():
+        normalized = _normalize_spaces(raw_line)
+        if normalized:
+            lines.append(normalized.replace("—", "-").replace("–", "-"))
     blob = "\n".join(lines)
 
     # Supports formats like file.feature:123, file.feature#L45, file.feature, line 10.
@@ -179,6 +200,16 @@ def _extract_failures_from_text(raw_text, source_url):
     )
     failures = []
     for i, line in enumerate(lines):
+        inline = INLINE_FAILURE_PATTERN.search(line)
+        if inline:
+            failures.append({
+                "feature_file": _normalize_spaces(inline.group(1)),
+                "scenario_name": "",
+                "failure_line": inline.group(2) or "",
+                "failure_reason": _normalize_spaces(inline.group(3))[:MAX_FAILURE_REASON_LENGTH],
+                "source_url": source_url
+            })
+            continue
         for m in pattern.finditer(line):
             feature = _normalize_spaces(m.group(1))
             failure_line = m.group(2) or ""
@@ -206,28 +237,123 @@ def _extract_failures_from_text(raw_text, source_url):
     return dedup
 
 
+def _json_sidecar_urls(url):
+    """Build likely JSON sidecar URLs for Karate/Cluecumber reports."""
+    base = url.rsplit("/", 1)[0] + "/"
+    candidates = [base + name for name in JSON_SIDECAR_CANDIDATE_FILES]
+    if url.lower().endswith(".html"):
+        candidates.append(re.sub(r"\.(?:html|htm)$", ".json", url, flags=re.IGNORECASE))
+    return list(dict.fromkeys(candidates))
+
+
+def _extract_failures_from_json_payload(payload, source_url):
+    """Extract failure-like records from JSON payloads with flexible schema."""
+    failures = []
+    seen = set()
+
+    def _str(v):
+        return _normalize_spaces(str(v)) if v is not None else ""
+
+    def _walk(node):
+        if isinstance(node, dict):
+            feature = ""
+            scenario = ""
+            failure_line = ""
+            reason = ""
+            status = _str(node.get("status")).lower() if "status" in node else ""
+
+            for k, v in node.items():
+                if k in JSON_FEATURE_KEYS and not feature:
+                    value = _str(v)
+                    m = re.search(r"([A-Za-z0-9_./\\-]+\.feature)", value, re.IGNORECASE)
+                    feature = m.group(1) if m else value
+                if k in JSON_SCENARIO_KEYS and not scenario:
+                    scenario = _str(v)
+                if k in JSON_LINE_KEYS and not failure_line:
+                    failure_line = re.sub(r"\D+", "", _str(v))
+                if k in JSON_REASON_KEYS and not reason:
+                    reason = _str(v)[:MAX_FAILURE_REASON_LENGTH]
+
+            if status in {"failed", "fail", "error"} and not reason:
+                reason = "Test failed (no error details available in report)"
+
+            if feature and (reason or status in {"failed", "fail", "error"}):
+                key = (feature, failure_line, reason)
+                if key not in seen:
+                    seen.add(key)
+                    failures.append({
+                        "feature_file": feature,
+                        "scenario_name": scenario,
+                        "failure_line": failure_line,
+                        "failure_reason": reason,
+                        "source_url": source_url
+                    })
+
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(payload)
+    return failures
+
+
 def extract_failures_for_report(data, msg):
     """Extract failures from linked reports, falling back to Webex message content."""
-    joined_text, _, _ = _all_text(msg)
+    joined_text, _, _, _ = _all_text(msg)
     links = [u for u in [data.get("karate_url"), data.get("cluecumber_url"), data.get("cucumber_url")] if u]
     failures = []
+    total_http_requests = 0
+    extracted_from_report_text = 0
+    extracted_from_json = 0
+    json_fetch_failures = 0
 
     for url in links:
         try:
             resp = requests.get(url, timeout=REPORT_FETCH_TIMEOUT)
+            total_http_requests += 1
             if resp.ok:
-                failures.extend(_extract_failures_from_text(resp.text, url))
+                text_failures = _extract_failures_from_text(resp.text, url)
+                failures.extend(text_failures)
+                extracted_from_report_text += len(text_failures)
+                if not text_failures:
+                    for json_url in _json_sidecar_urls(url):
+                        try:
+                            jr = requests.get(json_url, timeout=JSON_SIDECAR_FETCH_TIMEOUT)
+                            total_http_requests += 1
+                            if jr.ok:
+                                payload = jr.json()
+                                json_failures = _extract_failures_from_json_payload(payload, json_url)
+                                if json_failures:
+                                    failures.extend(json_failures)
+                                    extracted_from_json += len(json_failures)
+                                    break
+                        except Exception:
+                            json_fetch_failures += 1
+                            continue
         except Exception as exc:
             print(f"⚠️ Could not parse report URL {url}: {exc}")
             continue
 
     if not failures:
-        failures.extend(_extract_failures_from_text(joined_text, "webex_message"))
+        text_failures = _extract_failures_from_text(joined_text, "webex_message")
+        failures.extend(text_failures)
+        print(
+            f"   ℹ️ failure extraction stats: total_http_requests={total_http_requests}, "
+            f"text={extracted_from_report_text}, json={extracted_from_json}, json_fetch_failures={json_fetch_failures}, "
+            f"webex_text={len(text_failures)}"
+        )
+    else:
+        print(
+            f"   ℹ️ failure extraction stats: total_http_requests={total_http_requests}, "
+            f"text={extracted_from_report_text}, json={extracted_from_json}, json_fetch_failures={json_fetch_failures}, webex_text=0"
+        )
     return failures
 
 
 def parse_message(msg):
-    text, plain_text, markdown_text = _all_text(msg)
+    text, plain_text, markdown_text, html_payload = _all_text(msg)
 
     # Only process execution summary messages
     if not re.search(r"(execution\s+summary|scenarios?\s+passed|pass\s*%|scenarios?\s+failed)", text, re.IGNORECASE):
@@ -247,7 +373,7 @@ def parse_message(msg):
     dur    = re.search(r"duration\s*[:=]\s*([^|\n\r]+)", text, re.IGNORECASE)
 
     # Report links
-    links      = _extract_links(f"{plain_text}\n{markdown_text}")
+    links      = _extract_links(f"{plain_text}\n{markdown_text}\n{html_payload}")
     karate_url = next((l for l in links if "karate"     in l), "")
     clue_url   = next((l for l in links if "cluecumber" in l.lower()), "")
     cuke_url   = next((l for l in links if "cucumber"   in l.lower() and "karate" not in l), "")
@@ -326,9 +452,11 @@ def run():
     print(f"   Found {len(messages)} messages. Scanning for execution summaries...")
 
     saved = 0
+    parsed = 0
     for msg in messages:
         data = parse_message(msg)
         if data:
+            parsed += 1
             failures = []
             if data["scenarios_failed"] > 0:
                 failures = extract_failures_for_report(data, msg)
@@ -338,7 +466,7 @@ def run():
             print(f"   {status} {data['application']:<20} | env={data['env']:<15} | "
                   f"passed={data['scenarios_passed']} failed={data['scenarios_failed']}")
 
-    print(f"\n✅ Done! {saved} execution report(s) saved to {DB_FILE}")
+    print(f"\n✅ Done! parsed={parsed}, saved={saved} execution report(s) to {DB_FILE}")
     print("👉 Now run: python3 dashboard.py  →  open http://localhost:5000")
 
 
