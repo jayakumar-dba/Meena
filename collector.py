@@ -3,16 +3,24 @@ Run this script to pull messages from your Webex group chat
 and save execution summaries into a local SQLite database.
 
 Usage:
-    python3 collector.py
+    python3 collector.py                # interactive menu to choose date range
+    python3 collector.py --days 7       # last 7 days (non-interactive)
+    python3 collector.py --range today  # today only (non-interactive)
+    python3 collector.py --range week   # this week (non-interactive)
+    python3 collector.py --range 30days # last 30 days (non-interactive)
+
+Supported --range values: today, 7days, 30days, week
 """
 
+import argparse
 import re
 import sqlite3
 import requests
 import os
 import html
 from html.parser import HTMLParser
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -114,14 +122,120 @@ def init_db():
     print("✅ Database ready.")
 
 
+# ── Date-range helpers ────────────────────────────────────────────────────────
+
+# Maps canonical range names → (label, after_dt_factory)
+_RANGE_CHOICES = {
+    "today":   "Current date (today only)",
+    "7days":   "Last 7 days",
+    "30days":  "Last 30 days",
+    "week":    "This week (Mon – today)",
+}
+
+
+def _after_dt_for_range(range_key: str) -> datetime:
+    """Return the UTC datetime representing the start of the requested range."""
+    now = datetime.now(timezone.utc)
+    if range_key == "today":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if range_key == "7days":
+        return (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+    if range_key == "30days":
+        return (now - timedelta(days=30)).replace(hour=0, minute=0, second=0, microsecond=0)
+    if range_key == "week":
+        # Monday of the current week
+        monday = now - timedelta(days=now.weekday())
+        return monday.replace(hour=0, minute=0, second=0, microsecond=0)
+    raise ValueError(f"Unknown range key: {range_key!r}")
+
+
+def choose_date_range() -> tuple:
+    """Show an interactive menu and return (range_key, after_dt)."""
+    menu_items = [
+        ("today",  "1) Current date (today only)"),
+        ("7days",  "2) Last 7 days"),
+        ("30days", "3) Last 30 days"),
+        ("week",   "4) This week (Mon – today)"),
+    ]
+    print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("  📅  Choose data range to collect")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    for _, label in menu_items:
+        print(f"     {label}")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    valid = {"1": "today", "2": "7days", "3": "30days", "4": "week"}
+    while True:
+        try:
+            choice = input("Enter choice (1-4) [default: 2]: ").strip() or "2"
+        except (EOFError, KeyboardInterrupt):
+            print("\nUsing default: last 7 days")
+            choice = "2"
+        if choice in valid:
+            range_key = valid[choice]
+            after_dt = _after_dt_for_range(range_key)
+            print(f"\n✅ Range selected: {_RANGE_CHOICES[range_key]}")
+            print(f"   Fetching messages from {after_dt.strftime('%Y-%m-%d')} UTC onwards\n")
+            return range_key, after_dt
+        print("   ⚠️  Please enter a number between 1 and 4.")
+
+
 # ── Webex polling ─────────────────────────────────────────────────────────────
 
-def fetch_messages(max_msgs=100):
-    url    = "https://webexapis.com/v1/messages"
-    params = {"roomId": ROOM_ID, "max": max_msgs}
-    r = requests.get(url, headers=HEADERS, params=params)
-    r.raise_for_status()
-    return r.json().get("items", [])
+def fetch_messages(after_dt: Optional[datetime] = None, page_size: int = 200) -> List[dict]:
+    """Fetch Webex room messages, optionally limited to those created on/after *after_dt*.
+
+    The Webex messages endpoint returns results in reverse chronological order
+    (newest first) and does not support an ``after`` query parameter directly.
+    We therefore page through results in batches of *page_size* and stop as
+    soon as a message's ``created`` timestamp is older than *after_dt*.
+
+    If *after_dt* is None all available messages (up to Webex's hard limit) are
+    returned in a single request of size *page_size*.
+    """
+    url = "https://webexapis.com/v1/messages"
+    # Webex hard-cap per request is 1 000; stay well within it.
+    page_size = min(max(1, page_size), 1000)
+
+    all_messages: List[dict] = []
+    before_message_id: Optional[str] = None  # cursor for pagination
+
+    while True:
+        params: dict = {"roomId": ROOM_ID, "max": page_size}
+        if before_message_id:
+            params["beforeMessage"] = before_message_id
+
+        r = requests.get(url, headers=HEADERS, params=params)
+        r.raise_for_status()
+        page = r.json().get("items", [])
+
+        if not page:
+            break
+
+        if after_dt is None:
+            all_messages.extend(page)
+            break  # single-page, no date filtering
+
+        reached_cutoff = False
+        for msg in page:
+            created_raw = msg.get("created", "")
+            try:
+                # Webex returns ISO 8601 with trailing Z
+                created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                created_dt = None
+
+            if created_dt is not None and created_dt < after_dt:
+                reached_cutoff = True
+                break
+            all_messages.append(msg)
+
+        if reached_cutoff or len(page) < page_size:
+            break  # no more pages within the requested range
+
+        before_message_id = page[-1]["id"]  # advance cursor
+
+    return all_messages
 
 
 # ── Message parser ────────────────────────────────────────────────────────────
@@ -445,15 +559,78 @@ def save_report(data, failures=None):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _parse_args():
+    parser = argparse.ArgumentParser(
+        description="Collect Webex regression messages into the local SQLite DB.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 collector.py                 # interactive menu
+  python3 collector.py --days 7        # last 7 days
+  python3 collector.py --range today   # today only
+  python3 collector.py --range week    # this week (Mon – today)
+  python3 collector.py --range 30days  # last 30 days
+        """,
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--days",
+        type=int,
+        metavar="N",
+        help="Fetch messages from the last N days (e.g. --days 7).",
+    )
+    group.add_argument(
+        "--range",
+        choices=list(_RANGE_CHOICES.keys()),
+        metavar="RANGE",
+        help="Named range: today | 7days | 30days | week.",
+    )
+    return parser.parse_args()
+
+
+def _known_message_ids() -> set:
+    """Return the set of message IDs already stored in the database."""
+    try:
+        con = sqlite3.connect(DB_FILE)
+        rows = con.execute("SELECT message_id FROM reports").fetchall()
+        con.close()
+        return {r[0] for r in rows}
+    except Exception:
+        return set()
+
+
 def run():
+    args = _parse_args()
+
+    # Determine after_dt from CLI flags or interactive menu
+    if args.days is not None:
+        after_dt = (datetime.now(timezone.utc) - timedelta(days=args.days)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        label = f"last {args.days} day(s)"
+    elif args.range is not None:
+        after_dt = _after_dt_for_range(args.range)
+        label = _RANGE_CHOICES[args.range]
+    else:
+        _, after_dt = choose_date_range()
+        label = f"since {after_dt.strftime('%Y-%m-%d')}"
+
     init_db()
-    print("📡 Fetching messages from Webex...")
-    messages = fetch_messages()
-    print(f"   Found {len(messages)} messages. Scanning for execution summaries...")
+
+    print(f"📡 Fetching Webex messages ({label})…")
+    messages = fetch_messages(after_dt=after_dt)
+    print(f"   Found {len(messages)} message(s) in the selected window.")
+
+    # Skip messages already stored (deduplication by message_id)
+    known_ids = _known_message_ids()
+    new_messages = [m for m in messages if m.get("id") not in known_ids]
+    skipped = len(messages) - len(new_messages)
+    if skipped:
+        print(f"   ⏭️  Skipping {skipped} already-stored message(s).")
+    print(f"   Scanning {len(new_messages)} new message(s) for execution summaries…")
 
     saved = 0
     parsed = 0
-    for msg in messages:
+    for msg in new_messages:
         data = parse_message(msg)
         if data:
             parsed += 1
