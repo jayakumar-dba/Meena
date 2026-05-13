@@ -27,7 +27,7 @@ MAX_FAILURE_REASON_LENGTH = 500
 CONTEXT_WINDOW_BEFORE = 200
 CONTEXT_WINDOW_AFTER = 400
 REPORT_FETCH_TIMEOUT = 15
-JSON_SIDEcar_FETCH_TIMEOUT = 10
+JSON_SIDECAR_FETCH_TIMEOUT = 10
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -194,6 +194,7 @@ def _extract_failures_from_text(raw_text, source_url):
                 "failure_reason": _normalize_spaces(inline.group(3))[:MAX_FAILURE_REASON_LENGTH],
                 "source_url": source_url
             })
+            continue
         for m in pattern.finditer(line):
             feature = _normalize_spaces(m.group(1))
             failure_line = m.group(2) or ""
@@ -313,7 +314,7 @@ def extract_failures_for_report(data, msg):
                 if not text_failures:
                     for json_url in _json_sidecar_urls(url):
                         try:
-                            jr = requests.get(json_url, timeout=JSON_SIDEcar_FETCH_TIMEOUT)
+                            jr = requests.get(json_url, timeout=JSON_SIDECAR_FETCH_TIMEOUT)
                             url_fetches += 1
                             if jr.ok:
                                 payload = jr.json()
