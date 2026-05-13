@@ -292,13 +292,12 @@ def index():
     avg_pct    = round(sum(r["pass_percent"] for r in kpi_rows) / runs, 1) if runs else 0
 
     recurring = query(f"""
-        SELECT strftime('%Y-%W', r.executed_at) as week_key, f.feature_file, f.failure_reason, COUNT(*) as weekly_count
+        SELECT strftime('%Y-%W', r.executed_at) as week_key, f.feature_file, COUNT(*) as weekly_count
         FROM reports r
         JOIN failures f ON f.report_id = r.id
         WHERE {sql_where}
           AND f.feature_file != ''
-          AND f.failure_reason != ''
-        GROUP BY week_key, f.feature_file, f.failure_reason
+        GROUP BY week_key, f.feature_file
         ORDER BY weekly_count DESC
         LIMIT 6
     """, params)
@@ -318,12 +317,11 @@ def index():
             SELECT
                 strftime('%Y-%W', r2.executed_at) as week_key,
                 f2.feature_file,
-                f2.failure_reason,
                 COUNT(*) as weekly_recurrence
             FROM failures f2
             JOIN reports r2 ON r2.id = f2.report_id
-            WHERE f2.feature_file != '' AND f2.failure_reason != ''
-            GROUP BY week_key, f2.feature_file, f2.failure_reason
+            WHERE f2.feature_file != ''
+            GROUP BY week_key, f2.feature_file
         )
         SELECT
             r.executed_at,
@@ -347,7 +345,6 @@ def index():
         LEFT JOIN weekly_recurrence w
           ON w.week_key = strftime('%Y-%W', r.executed_at)
          AND w.feature_file = f.feature_file
-         AND w.failure_reason = f.failure_reason
         WHERE {sql_where}
         ORDER BY r.executed_at DESC, f.feature_file
     """, params)
