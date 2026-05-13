@@ -141,7 +141,7 @@ def _extract_links(text):
     """Extract and deduplicate HTTP(S) URLs while removing trailing punctuation."""
     links = []
     for link in re.findall(r"https?://[^\s)>\"]+", text):
-        clean = link.rstrip(").,]")
+        clean = re.sub(r"[)\],.]+$", "", link)
         if clean not in links:
             links.append(clean)
     return links
@@ -172,6 +172,7 @@ def _extract_failures_from_text(raw_text, source_url):
     lines = [_normalize_spaces(l) for l in cleaned.splitlines() if _normalize_spaces(l)]
     blob = "\n".join(lines)
 
+    # Supports formats like file.feature:123, file.feature#L45, file.feature, line 10.
     pattern = re.compile(
         r"([A-Za-z0-9_./\\-]+\.feature)(?:(?::|#L?|,\s*line\s+|\s+line\s+)(\d+))?",
         re.IGNORECASE
@@ -263,7 +264,7 @@ def parse_message(msg):
         "source_branch":    _extract_with_aliases(text, ["Source Branch", "Branch"]),
         "triggered_by":     _extract_with_aliases(text, ["Triggered by", "Triggered By", "Trigger User"]),
         "pipeline_id":      pipeline_link or next((l for l in links if "pipeline" in l.lower()), ""),
-        "job_id":           job_link or next((l for l in links if "/job/" in l.lower() or "job" in l.lower()), ""),
+        "job_id":           job_link or next((l for l in links if re.search(r"/jobs?/|[?&]job(?:id)?=", l, re.IGNORECASE)), ""),
         "scenarios_passed": int(passed.group(1)) if passed else 0,
         "scenarios_failed": int(failed.group(1)) if failed else 0,
         "pass_percent":     float(pct.group(1)) if pct else 0.0,

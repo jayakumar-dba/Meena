@@ -74,7 +74,7 @@ TEMPLATE = """
 <body>
 
 <nav class="navbar" style="padding:12px 20px">
-  <span class="fw-bold fs-5" aria-label="Dashboard title">🧪 Regression Quality Board</span>
+  <span class="fw-bold fs-5">🧪 Regression Quality Board</span>
   <span class="small ms-auto" style="opacity:.92">{{ total }} total runs in database</span>
 </nav>
 
@@ -204,20 +204,20 @@ TEMPLATE = """
             {{r['failure_reason'][:failure_reason_max] if r['failure_reason'] else '—'}}{{'…' if r['failure_reason'] and r['failure_reason']|length>failure_reason_max else ''}}
           </td>
           <td class="small">
-            {% if r['karate_url'] %}
-              <a class="focus-ring" href="{{r['karate_url']}}" target="_blank" rel="noopener noreferrer">Karate</a>
+            {% if r['karate_url_safe'] %}
+              <a class="focus-ring" href="{{r['karate_url_safe']}}" target="_blank" rel="noopener noreferrer">Karate</a>
             {% endif %}
-            {% if r['cluecumber_url'] %}
-              <a class="focus-ring" href="{{r['cluecumber_url']}}" target="_blank" rel="noopener noreferrer">Cluecumber</a>
+            {% if r['cluecumber_url_safe'] %}
+              <a class="focus-ring" href="{{r['cluecumber_url_safe']}}" target="_blank" rel="noopener noreferrer">Cluecumber</a>
             {% endif %}
-            {% if r['cucumber_url'] %}
-              <a class="focus-ring" href="{{r['cucumber_url']}}" target="_blank" rel="noopener noreferrer">Cucumber</a>
+            {% if r['cucumber_url_safe'] %}
+              <a class="focus-ring" href="{{r['cucumber_url_safe']}}" target="_blank" rel="noopener noreferrer">Cucumber</a>
             {% endif %}
-            {% if r['pipeline_id'] and 'http' in r['pipeline_id'] %}
-              <a class="focus-ring" href="{{r['pipeline_id']}}" target="_blank" rel="noopener noreferrer">Pipeline</a>
+            {% if r['pipeline_id_safe'] %}
+              <a class="focus-ring" href="{{r['pipeline_id_safe']}}" target="_blank" rel="noopener noreferrer">Pipeline</a>
             {% endif %}
-            {% if r['job_id'] and 'http' in r['job_id'] %}
-              <a class="focus-ring" href="{{r['job_id']}}" target="_blank" rel="noopener noreferrer">Job</a>
+            {% if r['job_id_safe'] %}
+              <a class="focus-ring" href="{{r['job_id_safe']}}" target="_blank" rel="noopener noreferrer">Job</a>
             {% endif %}
           </td>
           <td>
@@ -351,11 +351,21 @@ def index():
         WHERE {sql_where}
         ORDER BY r.executed_at DESC, f.feature_file
     """, params)
+    processed_failure_rows = []
+    for row in failure_rows:
+        r = dict(row)
+        for key in ["karate_url", "cluecumber_url", "cucumber_url", "pipeline_id", "job_id"]:
+            value = r.get(key) or ""
+            if isinstance(value, str) and value.startswith(("http://", "https://")):
+                r[f"{key}_safe"] = value
+            else:
+                r[f"{key}_safe"] = ""
+        processed_failure_rows.append(r)
 
     return render_template_string(
         TEMPLATE,
         reports=reports,
-        failure_rows=failure_rows,
+        failure_rows=processed_failure_rows,
         total=total,
         apps=apps,
         envs=envs,
