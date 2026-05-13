@@ -21,7 +21,7 @@ WEBEX_TOKEN = os.getenv("WEBEX_BOT_TOKEN")
 ROOM_ID     = os.getenv("WEBEX_ROOM_ID")
 DB_FILE     = "regression.db"
 HEADERS     = {"Authorization": f"Bearer {WEBEX_TOKEN}"}
-FAILURE_KEYWORDS = r"(fail|error|exception|assert|expected|mismatch|timeout)"
+FAILURE_PATTERN = r"(fail|error|exception|assert|expected|mismatch|timeout)"
 FAILURE_REASON_SEARCH_WINDOW = 8
 MAX_FAILURE_REASON_LENGTH = 500
 CONTEXT_WINDOW_BEFORE = 200
@@ -153,9 +153,7 @@ def _pick_reason(lines, idx):
         line = _normalize_spaces(lines[j])
         if not line:
             continue
-        if ".feature" in line.lower():
-            continue
-        if re.search(FAILURE_KEYWORDS, line, re.IGNORECASE):
+        if re.search(FAILURE_PATTERN, line, re.IGNORECASE):
             return line[:MAX_FAILURE_REASON_LENGTH]
     return ""
 

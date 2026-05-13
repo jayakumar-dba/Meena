@@ -156,7 +156,7 @@ TEMPLATE = """
             {{r['feature_file'][:feature_name_max]}}{{'…' if r['feature_file'] and r['feature_file']|length>feature_name_max else ''}}
           </span>
           <span class="small text-muted ms-2">wk {{r['week_key']}}</span>
-          <span class="pill pill-fail">{{r['weekly_count']}}x in week</span>
+          <span class="pill pill-fail">{{r['weekly_count']}}x/week</span>
         </div>
         {% else %}
         <div class="text-muted small text-center mt-3">🎉 No recurring failures in this range.</div>
@@ -276,8 +276,8 @@ def index():
 
     where  = ["r.executed_at >= ?"]
     params = [cutoff]
-    if app_f: where.append("application = ?"); params.append(app_f)
-    if env_f: where.append("env = ?");         params.append(env_f)
+    if app_f: where.append("r.application = ?"); params.append(app_f)
+    if env_f: where.append("r.env = ?");         params.append(env_f)
     sql_where = " AND ".join(where)
 
     reports    = query(f"SELECT * FROM reports r WHERE {sql_where} ORDER BY r.executed_at DESC", params)
@@ -314,6 +314,17 @@ def index():
                   for r in chart_rows]
 
     failure_rows = query(f"""
+        WITH weekly_recurrence AS (
+            SELECT
+                strftime('%Y-%W', r2.executed_at) as week_key,
+                f2.feature_file,
+                f2.failure_reason,
+                COUNT(*) as weekly_recurrence
+            FROM failures f2
+            JOIN reports r2 ON r2.id = f2.report_id
+            WHERE f2.feature_file != '' AND f2.failure_reason != ''
+            GROUP BY week_key, f2.feature_file, f2.failure_reason
+        )
         SELECT
             r.executed_at,
             r.application,
@@ -330,19 +341,13 @@ def index():
             f.feature_file,
             f.failure_line,
             f.failure_reason,
-            CASE
-                WHEN IFNULL(f.feature_file, '') != '' AND IFNULL(f.failure_reason, '') != '' THEN (
-                    SELECT COUNT(*)
-                    FROM failures f2
-                    JOIN reports r2 ON r2.id = f2.report_id
-                    WHERE f2.feature_file = f.feature_file
-                      AND f2.failure_reason = f.failure_reason
-                      AND strftime('%Y-%W', r2.executed_at) = strftime('%Y-%W', r.executed_at)
-                )
-                ELSE 0
-            END as weekly_recurrence
+            COALESCE(w.weekly_recurrence, 0) as weekly_recurrence
         FROM reports r
         LEFT JOIN failures f ON f.report_id = r.id
+        LEFT JOIN weekly_recurrence w
+          ON w.week_key = strftime('%Y-%W', r.executed_at)
+         AND w.feature_file = f.feature_file
+         AND w.failure_reason = f.failure_reason
         WHERE {sql_where}
         ORDER BY r.executed_at DESC, f.feature_file
     """, params)
