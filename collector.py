@@ -23,6 +23,13 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from dotenv import load_dotenv
 
+try:
+    from bs4 import BeautifulSoup as _BeautifulSoup
+    _BS4_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _BeautifulSoup = None  # type: ignore
+    _BS4_AVAILABLE = False
+
 load_dotenv()
 
 WEBEX_TOKEN = os.getenv("WEBEX_BOT_TOKEN")
@@ -36,6 +43,11 @@ CONTEXT_WINDOW_BEFORE = 200
 CONTEXT_WINDOW_AFTER = 400
 REPORT_FETCH_TIMEOUT = 15
 JSON_SIDECAR_FETCH_TIMEOUT = 10
+HTML_DETECTION_PREFIX_SIZE = 500
+# CSS class keywords used to identify failed-scenario containers in HTML reports
+FAILURE_CSS_KEYWORDS = ("failed", "failure", "error-row", "test-failed")
+# CSS class keywords used to locate error/reason text within a failed container
+ERROR_CSS_KEYWORDS = ("error", "message", "reason", "stack", "assert", "exception")
 INLINE_FAILURE_PATTERN = re.compile(
     r"([A-Za-z0-9_./\\-]+\.feature)(?::(\d+))?\s*-\s*(.+)",
     re.IGNORECASE
@@ -278,6 +290,62 @@ def _extract_links(text):
     return links
 
 
+def _parse_labeled_links_from_html(html_payload):
+    """Extract labeled report/pipeline URLs from a Webex message HTML payload.
+
+    Returns a dict with any of these keys present when a matching labeled
+    anchor is found: ``karate_url``, ``cluecumber_url``, ``cucumber_url``,
+    ``pipeline_url``, ``job_url``.  Uses BeautifulSoup when available,
+    otherwise falls back to regex on the raw HTML.
+    """
+    if not html_payload:
+        return {}
+
+    label_map = [
+        (r"karate(?:\s+summary)?\s+report", "karate_url"),
+        (r"cluecumber(?:\s+report)?", "cluecumber_url"),
+        (r"cucumber(?:\s+report)?", "cucumber_url"),
+        (r"pipeline(?:\s+link)?", "pipeline_url"),
+        (r"job(?:\s+link)?", "job_url"),
+    ]
+    result = {}
+
+    if _BS4_AVAILABLE:
+        try:
+            soup = _BeautifulSoup(html_payload, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if not href.startswith("http"):
+                    continue
+                anchor_text = a.get_text(" ", strip=True)
+                parent_text = a.parent.get_text(" ", strip=True) if a.parent else ""
+                context = f"{parent_text} {anchor_text}"
+                for pattern, key in label_map:
+                    if key not in result and re.search(pattern, context, re.IGNORECASE):
+                        result[key] = href
+                        break
+        except Exception:
+            pass
+    else:
+        # Regex fallback: find <a href="URL">…</a> preceded by a label keyword
+        for pattern, key in label_map:
+            if key in result:
+                continue
+            m = re.search(
+                rf'(?:{pattern})[^<]{{0,80}}<a\s[^>]*href=["\']([^"\']+)["\']',
+                html_payload, re.IGNORECASE | re.DOTALL,
+            )
+            if not m:
+                m = re.search(
+                    rf'<a\s[^>]*href=["\']([^"\']+)["\'][^>]*>[^<]*(?:{pattern})',
+                    html_payload, re.IGNORECASE | re.DOTALL,
+                )
+            if m:
+                result[key] = m.group(1)
+
+    return result
+
+
 def _pick_reason(lines, idx):
     """Pick the nearest failure-like reason line after a feature-file reference."""
     for j in range(idx, min(idx + FAILURE_REASON_SEARCH_WINDOW, len(lines))):
@@ -349,6 +417,168 @@ def _extract_failures_from_text(raw_text, source_url):
             seen.add(key)
             dedup.append(f)
     return dedup
+
+
+def _parse_report_html_bs4(html_text, url):
+    """Parse a Cluecumber/Karate/Cucumber HTML report using BeautifulSoup.
+
+    Three strategies are tried in order:
+
+    1. **Cluecumber / generic CSS class** – find any element whose CSS class
+       contains "fail" or "failure" and extract the feature file, scenario
+       name, and error text from within that element.
+    2. **Table rows** – find ``<table>`` elements that have a status/result
+       column whose cell value contains "fail", then extract columns for
+       feature file, scenario name, and error reason.
+    3. **Text fallback** – if neither strategy yields results, extract the
+       visible page text and pass it to ``_extract_failures_from_text``.
+
+    Falls back to ``_extract_failures_from_text`` entirely when BeautifulSoup
+    is not installed.
+    """
+    if not _BS4_AVAILABLE:
+        return _extract_failures_from_text(html_text, url)
+
+    try:
+        soup = _BeautifulSoup(html_text, "html.parser")
+    except Exception:
+        return _extract_failures_from_text(html_text, url)
+
+    failures = []
+    seen: set = set()
+    feature_pat = re.compile(
+        r'([A-Za-z0-9_./\\-]+\.feature)(?:[:#]L?(\d+))?', re.IGNORECASE
+    )
+
+    def _dedup_append(feat, scen, fline, reason):
+        feat = _normalize_spaces(feat)
+        scen = _normalize_spaces(scen)
+        fline = re.sub(r"\D", "", fline or "")
+        reason = _normalize_spaces(reason)[:MAX_FAILURE_REASON_LENGTH]
+        key = (feat, fline, reason[:80])
+        if feat and key not in seen:
+            seen.add(key)
+            failures.append({
+                "feature_file": feat,
+                "scenario_name": scen,
+                "failure_line": fline,
+                "failure_reason": reason,
+                "source_url": url,
+            })
+
+    # ── Strategy 1: containers/rows with "fail" CSS class ────────────────────
+    for container in soup.find_all(True):
+        css = " ".join(container.get("class") or []).lower()
+        if not any(kw in css for kw in FAILURE_CSS_KEYWORDS):
+            continue
+        text = container.get_text(" ", strip=True)
+        if len(text) < 8:
+            continue
+        fm = feature_pat.search(text)
+        if not fm:
+            continue
+        feature = fm.group(1)
+        fline = fm.group(2) or ""
+
+        # Scenario name: first heading or bold element that isn't the feature path
+        scen = ""
+        for ht in container.find_all(
+            ["h1", "h2", "h3", "h4", "h5", "h6", "strong", "b"], limit=6
+        ):
+            cand = ht.get_text(" ", strip=True)
+            if cand and ".feature" not in cand.lower():
+                scen = cand
+                break
+
+        # Failure reason: pre/code block first, then elements with error classes
+        reason = ""
+        for tag in container.find_all(["pre", "code"]):
+            t = tag.get_text(" ", strip=True)
+            if t and re.search(FAILURE_PATTERN, t, re.IGNORECASE):
+                reason = t
+                break
+        if not reason:
+            for tag in container.find_all(True):
+                tcss = " ".join(tag.get("class") or []).lower()
+                if any(kw in tcss for kw in ERROR_CSS_KEYWORDS):
+                    t = tag.get_text(" ", strip=True)
+                    if t and re.search(FAILURE_PATTERN, t, re.IGNORECASE):
+                        reason = t
+                        break
+
+        _dedup_append(feature, scen, fline, reason)
+
+    # ── Strategy 2: table rows with a "failed" status cell ───────────────────
+    if not failures:
+        for table in soup.find_all("table"):
+            hdrs = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+            st_col = next(
+                (i for i, h in enumerate(hdrs) if "status" in h or "result" in h), None
+            )
+            feat_col = next(
+                (i for i, h in enumerate(hdrs) if "feature" in h or "file" in h), None
+            )
+            sc_col = next(
+                (i for i, h in enumerate(hdrs) if "scenario" in h or "name" in h), None
+            )
+            err_col = next(
+                (
+                    i
+                    for i, h in enumerate(hdrs)
+                    if any(k in h for k in ("error", "reason", "message", "fail"))
+                ),
+                None,
+            )
+            for tr in table.find_all("tr"):
+                cells = tr.find_all(["td", "th"])
+                if not cells:
+                    continue
+                is_failed = False
+                if st_col is not None and st_col < len(cells):
+                    is_failed = "fail" in cells[st_col].get_text(strip=True).lower()
+                if not is_failed:
+                    row_css = " ".join(tr.get("class") or []).lower()
+                    is_failed = any(kw in row_css for kw in FAILURE_CSS_KEYWORDS)
+                if not is_failed:
+                    continue
+
+                feature = scen = fline = reason = ""
+                if feat_col is not None and feat_col < len(cells):
+                    t = cells[feat_col].get_text(strip=True)
+                    fm = feature_pat.search(t)
+                    feature = fm.group(1) if fm else t
+                    fline = (fm.group(2) or "") if fm else ""
+                else:
+                    row_text = tr.get_text(" ", strip=True)
+                    fm = feature_pat.search(row_text)
+                    if fm:
+                        feature = fm.group(1)
+                        fline = fm.group(2) or ""
+
+                if sc_col is not None and sc_col < len(cells):
+                    scen = cells[sc_col].get_text(strip=True)
+
+                if err_col is not None and err_col < len(cells):
+                    reason = cells[err_col].get_text(strip=True)
+                elif feature:
+                    skip = {st_col, feat_col, sc_col}
+                    for i, cell in enumerate(cells):
+                        if i in skip:
+                            continue
+                        t = cell.get_text(strip=True)
+                        if t and re.search(FAILURE_PATTERN, t, re.IGNORECASE):
+                            reason = t
+                            break
+
+                if feature:
+                    _dedup_append(feature, scen, fline, reason)
+
+    # ── Strategy 3: visible text fallback ────────────────────────────────────
+    if not failures:
+        visible = soup.get_text("\n", strip=True)
+        failures.extend(_extract_failures_from_text(visible, url))
+
+    return failures
 
 
 def _json_sidecar_urls(url):
@@ -428,7 +658,13 @@ def extract_failures_for_report(data, msg):
             resp = requests.get(url, timeout=REPORT_FETCH_TIMEOUT)
             total_http_requests += 1
             if resp.ok:
-                text_failures = _extract_failures_from_text(resp.text, url)
+                content_type = resp.headers.get("content-type", "").lower()
+                prefix = resp.text[:HTML_DETECTION_PREFIX_SIZE].lstrip().lower()
+                is_html = "html" in content_type or prefix.startswith("<!doctype") or "<html" in prefix
+                if is_html:
+                    text_failures = _parse_report_html_bs4(resp.text, url)
+                else:
+                    text_failures = _extract_failures_from_text(resp.text, url)
                 failures.extend(text_failures)
                 extracted_from_report_text += len(text_failures)
                 if not text_failures:
@@ -486,13 +722,25 @@ def parse_message(msg):
     pct    = re.search(r"(?:pass\s*%|pass\s*rate)\s*[:=]\s*([\d.]+)", text, re.IGNORECASE)
     dur    = re.search(r"duration\s*[:=]\s*([^|\n\r]+)", text, re.IGNORECASE)
 
-    # Report links
+    # Report links — keyword match on URL path first, then label-based fallback
     links      = _extract_links(f"{plain_text}\n{markdown_text}\n{html_payload}")
     karate_url = next((l for l in links if "karate"     in l), "")
     clue_url   = next((l for l in links if "cluecumber" in l.lower()), "")
     cuke_url   = next((l for l in links if "cucumber"   in l.lower() and "karate" not in l), "")
     pipeline_link = _extract_with_aliases(text, ["Pipeline Link", "Pipeline", "Pipeline URL"])
     job_link = _extract_with_aliases(text, ["Job Link", "Job URL"])
+
+    # Supplement with label-based extraction from Webex HTML payload
+    labeled = _parse_labeled_links_from_html(html_payload)
+    if not karate_url:
+        karate_url = labeled.get("karate_url", "")
+    if not clue_url:
+        clue_url = labeled.get("cluecumber_url", "")
+    if not cuke_url:
+        cuke_url = labeled.get("cucumber_url", "")
+    if not pipeline_link:
+        pipeline_link = labeled.get("pipeline_url", "")
+    job_link = job_link or labeled.get("job_url", "")
 
     return {
         "message_id":       msg["id"],
