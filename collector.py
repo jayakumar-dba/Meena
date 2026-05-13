@@ -28,6 +28,21 @@ CONTEXT_WINDOW_BEFORE = 200
 CONTEXT_WINDOW_AFTER = 400
 REPORT_FETCH_TIMEOUT = 15
 JSON_SIDECAR_FETCH_TIMEOUT = 10
+INLINE_FAILURE_PATTERN = re.compile(
+    r"([A-Za-z0-9_./\\-]+\.feature)(?::(\d+))?\s*-\s*(.+)",
+    re.IGNORECASE
+)
+JSON_SIDECAR_CANDIDATE_FILES = [
+    "karate-summary-json.txt",
+    "karate-summary.json",
+    "summary.json",
+    "data.json",
+    "report.json",
+]
+JSON_FEATURE_KEYS = {"feature", "feature_file", "uri", "path", "location", "featureName", "relativePath", "fileName"}
+JSON_SCENARIO_KEYS = {"scenario", "scenario_name", "scenarioName", "name"}
+JSON_LINE_KEYS = {"line", "lineNumber", "failedLine", "errorLine"}
+JSON_REASON_KEYS = {"errorMessage", "failureReason", "reason", "message", "error", "stepErrorMessage", "stackTrace"}
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -171,12 +186,12 @@ def _extract_failures_from_text(raw_text, source_url):
         cleaned = parser.get_text()
     else:
         cleaned = text
-    lines = [_normalize_spaces(l) for l in cleaned.splitlines() if _normalize_spaces(l)]
+    lines = []
+    for raw_line in cleaned.splitlines():
+        normalized = _normalize_spaces(raw_line)
+        if normalized:
+            lines.append(normalized.replace("—", "-").replace("–", "-"))
     blob = "\n".join(lines)
-    inline_pattern = re.compile(
-        r"([A-Za-z0-9_./\\-]+\.feature)(?::(\d+))?\s*-\s*(.+)",
-        re.IGNORECASE
-    )
 
     # Supports formats like file.feature:123, file.feature#L45, file.feature, line 10.
     pattern = re.compile(
@@ -185,7 +200,7 @@ def _extract_failures_from_text(raw_text, source_url):
     )
     failures = []
     for i, line in enumerate(lines):
-        inline = inline_pattern.search(line.replace("—", "-").replace("–", "-"))
+        inline = INLINE_FAILURE_PATTERN.search(line)
         if inline:
             failures.append({
                 "feature_file": _normalize_spaces(inline.group(1)),
@@ -225,13 +240,7 @@ def _extract_failures_from_text(raw_text, source_url):
 def _json_sidecar_urls(url):
     """Build likely JSON sidecar URLs for Karate/Cluecumber reports."""
     base = url.rsplit("/", 1)[0] + "/"
-    candidates = [
-        base + "karate-summary-json.txt",
-        base + "karate-summary.json",
-        base + "summary.json",
-        base + "data.json",
-        base + "report.json",
-    ]
+    candidates = [base + name for name in JSON_SIDECAR_CANDIDATE_FILES]
     if url.lower().endswith(".html"):
         candidates.append(re.sub(r"\.(?:html|htm)$", ".json", url, flags=re.IGNORECASE))
     return list(dict.fromkeys(candidates))
@@ -241,10 +250,6 @@ def _extract_failures_from_json_payload(payload, source_url):
     """Extract failure-like records from JSON payloads with flexible schema."""
     failures = []
     seen = set()
-    feature_keys = {"feature", "feature_file", "uri", "path", "location", "featureName", "relativePath", "fileName"}
-    scenario_keys = {"scenario", "scenario_name", "scenarioName", "name"}
-    line_keys = {"line", "lineNumber", "failedLine", "errorLine"}
-    reason_keys = {"errorMessage", "failureReason", "reason", "message", "error", "stepErrorMessage", "stackTrace"}
 
     def _str(v):
         return _normalize_spaces(str(v)) if v is not None else ""
@@ -258,19 +263,19 @@ def _extract_failures_from_json_payload(payload, source_url):
             status = _str(node.get("status")).lower() if "status" in node else ""
 
             for k, v in node.items():
-                if k in feature_keys and not feature:
+                if k in JSON_FEATURE_KEYS and not feature:
                     value = _str(v)
                     m = re.search(r"([A-Za-z0-9_./\\-]+\.feature)", value, re.IGNORECASE)
                     feature = m.group(1) if m else value
-                if k in scenario_keys and not scenario:
+                if k in JSON_SCENARIO_KEYS and not scenario:
                     scenario = _str(v)
-                if k in line_keys and not failure_line:
+                if k in JSON_LINE_KEYS and not failure_line:
                     failure_line = re.sub(r"\D+", "", _str(v))
-                if k in reason_keys and not reason:
+                if k in JSON_REASON_KEYS and not reason:
                     reason = _str(v)[:MAX_FAILURE_REASON_LENGTH]
 
             if status in {"failed", "fail", "error"} and not reason:
-                reason = "Failed"
+                reason = "Test failed (no error details available in report)"
 
             if feature and (reason or status in {"failed", "fail", "error"}):
                 key = (feature, failure_line, reason)
@@ -299,14 +304,15 @@ def extract_failures_for_report(data, msg):
     joined_text, _, _, _ = _all_text(msg)
     links = [u for u in [data.get("karate_url"), data.get("cluecumber_url"), data.get("cucumber_url")] if u]
     failures = []
-    url_fetches = 0
+    total_http_requests = 0
     extracted_from_report_text = 0
     extracted_from_json = 0
+    json_fetch_failures = 0
 
     for url in links:
         try:
             resp = requests.get(url, timeout=REPORT_FETCH_TIMEOUT)
-            url_fetches += 1
+            total_http_requests += 1
             if resp.ok:
                 text_failures = _extract_failures_from_text(resp.text, url)
                 failures.extend(text_failures)
@@ -315,7 +321,7 @@ def extract_failures_for_report(data, msg):
                     for json_url in _json_sidecar_urls(url):
                         try:
                             jr = requests.get(json_url, timeout=JSON_SIDECAR_FETCH_TIMEOUT)
-                            url_fetches += 1
+                            total_http_requests += 1
                             if jr.ok:
                                 payload = jr.json()
                                 json_failures = _extract_failures_from_json_payload(payload, json_url)
@@ -324,6 +330,7 @@ def extract_failures_for_report(data, msg):
                                     extracted_from_json += len(json_failures)
                                     break
                         except Exception:
+                            json_fetch_failures += 1
                             continue
         except Exception as exc:
             print(f"⚠️ Could not parse report URL {url}: {exc}")
@@ -333,14 +340,14 @@ def extract_failures_for_report(data, msg):
         text_failures = _extract_failures_from_text(joined_text, "webex_message")
         failures.extend(text_failures)
         print(
-            f"   ℹ️ failure extraction stats: report_urls={url_fetches}, "
-            f"text={extracted_from_report_text}, json={extracted_from_json}, "
+            f"   ℹ️ failure extraction stats: total_http_requests={total_http_requests}, "
+            f"text={extracted_from_report_text}, json={extracted_from_json}, json_fetch_failures={json_fetch_failures}, "
             f"webex_text={len(text_failures)}"
         )
     else:
         print(
-            f"   ℹ️ failure extraction stats: report_urls={url_fetches}, "
-            f"text={extracted_from_report_text}, json={extracted_from_json}, webex_text=0"
+            f"   ℹ️ failure extraction stats: total_http_requests={total_http_requests}, "
+            f"text={extracted_from_report_text}, json={extracted_from_json}, json_fetch_failures={json_fetch_failures}, webex_text=0"
         )
     return failures
 
