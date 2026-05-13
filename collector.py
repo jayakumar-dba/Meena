@@ -174,7 +174,7 @@ def _extract_failures_from_text(raw_text, source_url):
     lines = [_normalize_spaces(l) for l in cleaned.splitlines() if _normalize_spaces(l)]
     blob = "\n".join(lines)
     inline_pattern = re.compile(
-        r"([A-Za-z0-9_./\\-]+\.feature)(?::(\d+))?\s*[—–-]\s*(.+)",
+        r"([A-Za-z0-9_./\\-]+\.feature)(?::(\d+))?\s*-\s*(.+)",
         re.IGNORECASE
     )
 
@@ -185,7 +185,7 @@ def _extract_failures_from_text(raw_text, source_url):
     )
     failures = []
     for i, line in enumerate(lines):
-        inline = inline_pattern.search(line)
+        inline = inline_pattern.search(line.replace("—", "-").replace("–", "-"))
         if inline:
             failures.append({
                 "feature_file": _normalize_spaces(inline.group(1)),
@@ -233,7 +233,7 @@ def _json_sidecar_urls(url):
         base + "report.json",
     ]
     if url.lower().endswith(".html"):
-        candidates.append(re.sub(r"\.html?$", ".json", url, flags=re.IGNORECASE))
+        candidates.append(re.sub(r"\.(?:html|htm)$", ".json", url, flags=re.IGNORECASE))
     return list(dict.fromkeys(candidates))
 
 
@@ -459,7 +459,7 @@ def run():
             print(f"   {status} {data['application']:<20} | env={data['env']:<15} | "
                   f"passed={data['scenarios_passed']} failed={data['scenarios_failed']}")
 
-    print(f"\n✅ Done! parsed={parsed}, saved={saved} execution report(s) saved to {DB_FILE}")
+    print(f"\n✅ Done! parsed={parsed}, saved={saved} execution report(s) to {DB_FILE}")
     print("👉 Now run: python3 dashboard.py  →  open http://localhost:5000")
 
 
