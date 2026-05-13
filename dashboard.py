@@ -211,8 +211,8 @@ TEMPLATE = """
         <div class="trend-row">
           <div class="small text-muted">{{d.date}}</div>
           <div class="trend-bars">
-            <div class="trend-bar-pass" aria-label="Passed: {{d.passed}} scenarios" style="width: {{ (d.passed / chart_scale * 100) if chart_scale else 0 }}%;">{{d.passed}}</div>
-            <div class="trend-bar-fail" aria-label="Failed: {{d.failed}} scenarios" style="width: {{ (d.failed / chart_scale * 100) if chart_scale else 0 }}%;">{{d.failed}}</div>
+            <div class="trend-bar-pass" aria-label="Passed: {{d.passed}} scenarios" style="width: {{ (d.passed / chart_scale * 100) }}%;">{{d.passed}}</div>
+            <div class="trend-bar-fail" aria-label="Failed: {{d.failed}} scenarios" style="width: {{ (d.failed / chart_scale * 100) }}%;">{{d.failed}}</div>
           </div>
         </div>
         {% else %}
@@ -454,7 +454,7 @@ def index():
     """, params)
     chart_data = [{"date": r["date"], "passed": r["passed"], "failed": r["failed"]}
                   for r in chart_rows]
-    chart_scale = max((max(d.get("passed") or 0, d.get("failed") or 0) for d in chart_data), default=1)
+    chart_scale = max((max(d["passed"] or 0, d["failed"] or 0) for d in chart_data), default=1)
 
     failure_rows = query(f"""
         SELECT

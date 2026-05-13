@@ -11,7 +11,6 @@ import sqlite3
 import requests
 import os
 import html
-from itertools import chain
 from html.parser import HTMLParser
 from datetime import datetime
 from dotenv import load_dotenv
@@ -345,10 +344,10 @@ def parse_message(msg):
     pipeline_id = _find_id(text, ["Pipeline Link", "Pipeline ID", "Pipeline"]) or _id_from_url(pipeline_url, "pipeline")
     job_id = _find_id(text, ["Job Link", "Job ID", "Job"]) or _id_from_url(job_url, "job")
 
-    project_url = _extract_gitlab_project_url(chain([pipeline_url, job_url, karate_url, clue_url, cuke_url], links))
+    project_url = _extract_gitlab_project_url([pipeline_url, job_url, karate_url, clue_url, cuke_url] + links)
     if project_url and pipeline_id and (not pipeline_url or not re.search(r"/-/pipelines/\d+\b", pipeline_url)):
         pipeline_url = f"{project_url}/-/pipelines/{pipeline_id}"
-    if project_url and job_id and (not job_url or not re.search(r"/-/jobs/\d+\b$", job_url)):
+    if project_url and job_id and (not job_url or not re.search(r"/-/jobs/\d+\b", job_url)):
         job_url = f"{project_url}/-/jobs/{job_id}"
 
     return {
