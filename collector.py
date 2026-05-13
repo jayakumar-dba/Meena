@@ -11,6 +11,7 @@ import sqlite3
 import requests
 import os
 import html
+from html.parser import HTMLParser
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -21,6 +22,34 @@ ROOM_ID     = os.getenv("WEBEX_ROOM_ID")
 DB_FILE     = "regression.db"
 HEADERS     = {"Authorization": f"Bearer {WEBEX_TOKEN}"}
 FAILURE_KEYWORDS = r"(fail|error|exception|assert|expected|mismatch|timeout)"
+FAILURE_REASON_SEARCH_WINDOW = 8
+MAX_FAILURE_REASON_LENGTH = 500
+CONTEXT_WINDOW_BEFORE = 200
+CONTEXT_WINDOW_AFTER = 400
+REPORT_FETCH_TIMEOUT = 15
+
+
+class _HTMLTextExtractor(HTMLParser):
+    """Extract visible text and skip script/style content in HTML."""
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self.skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() in {"script", "style"}:
+            self.skip_depth += 1
+
+    def handle_endtag(self, tag):
+        if tag.lower() in {"script", "style"} and self.skip_depth > 0:
+            self.skip_depth -= 1
+
+    def handle_data(self, data):
+        if self.skip_depth == 0 and data:
+            self.parts.append(data)
+
+    def get_text(self):
+        return "\n".join(self.parts)
 
 
 # ── Database setup ────────────────────────────────────────────────────────────
@@ -120,14 +149,14 @@ def _extract_links(text):
 
 def _pick_reason(lines, idx):
     """Pick the nearest failure-like reason line after a feature-file reference."""
-    for j in range(idx, min(idx + 8, len(lines))):
+    for j in range(idx, min(idx + FAILURE_REASON_SEARCH_WINDOW, len(lines))):
         line = _normalize_spaces(lines[j])
         if not line:
             continue
         if ".feature" in line.lower():
             continue
         if re.search(FAILURE_KEYWORDS, line, re.IGNORECASE):
-            return line[:500]
+            return line[:MAX_FAILURE_REASON_LENGTH]
     return ""
 
 
@@ -136,8 +165,12 @@ def _extract_failures_from_text(raw_text, source_url):
     if not raw_text:
         return []
     text = html.unescape(raw_text)
-    cleaned = re.sub(r"(?is)<script\b[^>]*>.*?</script\s*>|<style\b[^>]*>.*?</style\s*>", " ", text)
-    cleaned = re.sub(r"<[^>]+>", "\n", cleaned)
+    if "<" in text and ">" in text:
+        parser = _HTMLTextExtractor()
+        parser.feed(text)
+        cleaned = parser.get_text()
+    else:
+        cleaned = text
     lines = [_normalize_spaces(l) for l in cleaned.splitlines() if _normalize_spaces(l)]
     blob = "\n".join(lines)
 
@@ -152,7 +185,8 @@ def _extract_failures_from_text(raw_text, source_url):
             failure_line = m.group(2) or ""
             reason = _pick_reason(lines, i)
             if not reason:
-                around = blob[max(0, blob.find(line) - 200): blob.find(line) + 400]
+                line_pos = blob.find(line)
+                around = blob[max(0, line_pos - CONTEXT_WINDOW_BEFORE): line_pos + CONTEXT_WINDOW_AFTER]
                 rm = re.search(r"(AssertionError:.*|Exception:.*|ERROR[:\s].*|FAILED[:\s].*)", around, re.IGNORECASE)
                 reason = _normalize_spaces(rm.group(1)) if rm else ""
             failures.append({
@@ -181,7 +215,7 @@ def extract_failures_for_report(data, msg):
 
     for url in links:
         try:
-            resp = requests.get(url, timeout=15)
+            resp = requests.get(url, timeout=REPORT_FETCH_TIMEOUT)
             if resp.ok:
                 failures.extend(_extract_failures_from_text(resp.text, url))
         except Exception as exc:

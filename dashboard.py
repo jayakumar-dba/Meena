@@ -152,7 +152,7 @@ TEMPLATE = """
         <div class="text-muted small mb-2">🔥 Weekly recurring failures</div>
         {% for r in recurring %}
         <div class="d-flex justify-content-between align-items-center mb-2">
-          <span class="small" title="{{r['failure_reason']}}">
+          <span class="small" title="{{r['feature_file']}}">
             {{r['feature_file'][:feature_name_max]}}{{'…' if r['feature_file'] and r['feature_file']|length>feature_name_max else ''}}
           </span>
           <span class="small text-muted ms-2">wk {{r['week_key']}}</span>
@@ -221,7 +221,7 @@ TEMPLATE = """
             {% endif %}
           </td>
           <td>
-            {% if r['weekly_recurrence'] and r['weekly_recurrence'] > 0 %}
+            {% if r['weekly_recurrence'] %}
               <span class="pill {{'pill-fail' if r['weekly_recurrence'] >= recurring_threshold else 'pill-warn'}}">{{r['weekly_recurrence']}}x</span>
             {% else %}
               <span class="pill pill-pass">0</span>
