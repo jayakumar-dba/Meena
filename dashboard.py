@@ -69,6 +69,22 @@ TEMPLATE = """
       outline: 3px solid var(--focus);
       outline-offset: 2px;
     }
+    /* Colour-coded report link badges */
+    .rpt-badge {
+      display:inline-block; padding:3px 9px; border-radius:10px;
+      font-size:.70rem; font-weight:700; margin:2px 1px;
+      text-decoration:none; white-space:nowrap;
+    }
+    .rpt-karate     { background:#e8eeff; color:#2948c6; border:1px solid #b8c4ff; }
+    .rpt-karate:hover { background:#c7d3ff; }
+    .rpt-cluecumber { background:#fff3e0; color:#b45309; border:1px solid #ffd599; }
+    .rpt-cluecumber:hover { background:#ffe0b2; }
+    .rpt-cucumber   { background:#e9f7ef; color:#166534; border:1px solid #a7f3d0; }
+    .rpt-cucumber:hover { background:#c6f6d5; }
+    .rpt-pipeline   { background:#f3e8ff; color:#6b21a8; border:1px solid #d8b4fe; }
+    .rpt-pipeline:hover { background:#e9d5ff; }
+    .rpt-job        { background:#fce7f3; color:#9d174d; border:1px solid #fbcfe8; }
+    .rpt-job:hover  { background:#fce7f3; }
   </style>
 </head>
 <body>
@@ -204,21 +220,21 @@ TEMPLATE = """
             {{r['failure_reason'][:failure_reason_max] if r['failure_reason'] else '—'}}{{'…' if r['failure_reason'] and r['failure_reason']|length>failure_reason_max else ''}}
           </td>
           <td class="small">
-            {% if r['karate_url_safe'] %}
-              <a class="focus-ring" href="{{r['karate_url_safe']}}" target="_blank" rel="noopener noreferrer">Karate</a>
-            {% endif %}
-            {% if r['cluecumber_url_safe'] %}
-              <a class="focus-ring" href="{{r['cluecumber_url_safe']}}" target="_blank" rel="noopener noreferrer">Cluecumber</a>
-            {% endif %}
-            {% if r['cucumber_url_safe'] %}
-              <a class="focus-ring" href="{{r['cucumber_url_safe']}}" target="_blank" rel="noopener noreferrer">Cucumber</a>
-            {% endif %}
-            {% if r['pipeline_id_safe'] %}
-              <a class="focus-ring" href="{{r['pipeline_id_safe']}}" target="_blank" rel="noopener noreferrer">Pipeline</a>
-            {% endif %}
-            {% if r['job_id_safe'] %}
-              <a class="focus-ring" href="{{r['job_id_safe']}}" target="_blank" rel="noopener noreferrer">Job</a>
-            {% endif %}
+            {% set report_links = [
+              (r['karate_url_safe'],     'rpt-karate',     '📊 Karate'),
+              (r['cluecumber_url_safe'], 'rpt-cluecumber', '🔎 Cluecumber'),
+              (r['cucumber_url_safe'],   'rpt-cucumber',   '🥒 Cucumber'),
+              (r['pipeline_id_safe'],    'rpt-pipeline',   '⚙️ Pipeline'),
+              (r['job_id_safe'],         'rpt-job',        '🔧 Job'),
+            ] %}
+            {% set has_link = namespace(value=false) %}
+            {% for url, cls, label in report_links %}
+              {% if url %}
+                {% set has_link.value = true %}
+                <a class="rpt-badge {{cls}} focus-ring" href="{{url}}" target="_blank" rel="noopener noreferrer">{{label}}</a>
+              {% endif %}
+            {% endfor %}
+            {% if not has_link.value %}<span class="text-muted">—</span>{% endif %}
           </td>
           <td>
             {% if r['weekly_recurrence'] %}

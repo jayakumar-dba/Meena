@@ -44,6 +44,9 @@ CONTEXT_WINDOW_AFTER = 400
 REPORT_FETCH_TIMEOUT = 15
 JSON_SIDECAR_FETCH_TIMEOUT = 10
 HTML_DETECTION_PREFIX_SIZE = 500
+# Max characters allowed between a report label keyword and its URL in plain text.
+# Covers common separators such as ": ", " - ", " → " plus Markdown bold markers.
+_MAX_LABEL_TO_URL_SPACING = 60
 # CSS class keywords used to identify failed-scenario containers in HTML reports
 FAILURE_CSS_KEYWORDS = ("failed", "failure", "error-row", "test-failed")
 # CSS class keywords used to locate error/reason text within a failed container
@@ -290,6 +293,48 @@ def _extract_links(text):
     return links
 
 
+# Label patterns shared between HTML and plain-text link extraction.
+# Each entry: (regex_pattern_for_label, result_dict_key)
+# Patterns are intentionally broad so single-word labels (e.g. "Karate", "Cluecumber")
+# are matched in addition to longer forms like "Karate Summary Report".
+_REPORT_LABEL_PATTERNS = [
+    (r"karate(?:[\s_-]*(?:summary|report))*", "karate_url"),
+    (r"cluecumber(?:[\s_-]*report)?", "cluecumber_url"),
+    (r"cucumber(?:[\s_-]*report)?", "cucumber_url"),
+    (r"pipeline(?:[\s_-]*(?:link|url|id))?", "pipeline_url"),
+    (r"job(?:[\s_-]*(?:link|url|id))?", "job_url"),
+]
+
+
+def _parse_labeled_links_from_text(text):
+    """Extract labeled report/pipeline URLs from plain text or Markdown.
+
+    Handles lines like::
+
+        Karate Report: https://ci.example.com/artifacts/karate.html
+        **Cluecumber**: https://ci.example.com/cluecumber/
+        Cucumber Report - https://ci.example.com/cucumber/overview.html
+
+    Returns a dict with any of: ``karate_url``, ``cluecumber_url``,
+    ``cucumber_url``, ``pipeline_url``, ``job_url``.
+    """
+    if not text:
+        return {}
+    result = {}
+    for pattern, key in _REPORT_LABEL_PATTERNS:
+        if key in result:
+            continue
+        # Allow up to _MAX_LABEL_TO_URL_SPACING characters between label and URL
+        # (covers " : ", " - ", " → ", Markdown bold markers **…**, etc.)
+        m = re.search(
+            rf"(?:\*{{0,2}})?{pattern}(?:\*{{0,2}})?[^h\n]{{0,{_MAX_LABEL_TO_URL_SPACING}}}(https?://[^\s)>\",]+)",
+            text, re.IGNORECASE,
+        )
+        if m:
+            result[key] = re.sub(r"[)\],.]+$", "", m.group(1))
+    return result
+
+
 def _parse_labeled_links_from_html(html_payload):
     """Extract labeled report/pipeline URLs from a Webex message HTML payload.
 
@@ -301,13 +346,6 @@ def _parse_labeled_links_from_html(html_payload):
     if not html_payload:
         return {}
 
-    label_map = [
-        (r"karate(?:\s+summary)?\s+report", "karate_url"),
-        (r"cluecumber(?:\s+report)?", "cluecumber_url"),
-        (r"cucumber(?:\s+report)?", "cucumber_url"),
-        (r"pipeline(?:\s+link)?", "pipeline_url"),
-        (r"job(?:\s+link)?", "job_url"),
-    ]
     result = {}
 
     if _BS4_AVAILABLE:
@@ -320,15 +358,15 @@ def _parse_labeled_links_from_html(html_payload):
                 anchor_text = a.get_text(" ", strip=True)
                 parent_text = a.parent.get_text(" ", strip=True) if a.parent else ""
                 context = f"{parent_text} {anchor_text}"
-                for pattern, key in label_map:
+                for pattern, key in _REPORT_LABEL_PATTERNS:
                     if key not in result and re.search(pattern, context, re.IGNORECASE):
                         result[key] = href
                         break
         except Exception:
             pass
     else:
-        # Regex fallback: find <a href="URL">…</a> preceded by a label keyword
-        for pattern, key in label_map:
+        # Regex fallback: find <a href="URL">…</a> preceded/followed by a label keyword
+        for pattern, key in _REPORT_LABEL_PATTERNS:
             if key in result:
                 continue
             m = re.search(
@@ -380,6 +418,17 @@ def _extract_failures_from_text(raw_text, source_url):
         r"([A-Za-z0-9_./\\-]+\.feature)(?:(?::|#L?|,\s*line\s+|\s+line\s+)(\d+))?",
         re.IGNORECASE
     )
+
+    # Extra: catch "Failed Scenario: <name>" or "❌ <feature> - <reason>" or
+    # "Failure: <feature> at line <N> - <reason>" style lines that don't carry
+    # a .feature extension.  Lazy quantifier + lookahead ensure the name stops
+    # before " - " or " at line ".
+    scenario_failure_pat = re.compile(
+        r"(?:failed\s+scenario|failure|❌)[:\s]+(.+?)(?=\s+at\s+line\s+\d|\s+-\s|\Z)"
+        rf"(?:\s+at\s+line\s+(\d+))?\s*(?:-\s*(.{{1,{MAX_FAILURE_REASON_LENGTH}}}))?",
+        re.IGNORECASE,
+    )
+
     failures = []
     for i, line in enumerate(lines):
         inline = INLINE_FAILURE_PATTERN.search(line)
@@ -392,7 +441,9 @@ def _extract_failures_from_text(raw_text, source_url):
                 "source_url": source_url
             })
             continue
+        matched_feature = False
         for m in pattern.finditer(line):
+            matched_feature = True
             feature = _normalize_spaces(m.group(1))
             failure_line = m.group(2) or ""
             reason = _pick_reason(lines, i)
@@ -408,6 +459,22 @@ def _extract_failures_from_text(raw_text, source_url):
                 "failure_reason": reason,
                 "source_url": source_url
             })
+        # If no .feature reference on this line, try the scenario failure pattern
+        if not matched_feature:
+            sm = scenario_failure_pat.search(line)
+            if sm:
+                name_or_feature = _normalize_spaces(sm.group(1))
+                fline = sm.group(2) or ""
+                reason = _normalize_spaces(sm.group(3) or "")[:MAX_FAILURE_REASON_LENGTH]
+                if not reason:
+                    reason = _pick_reason(lines, i + 1)
+                failures.append({
+                    "feature_file": name_or_feature,
+                    "scenario_name": "",
+                    "failure_line": fline,
+                    "failure_reason": reason,
+                    "source_url": source_url
+                })
 
     dedup = []
     seen = set()
@@ -722,25 +789,54 @@ def parse_message(msg):
     pct    = re.search(r"(?:pass\s*%|pass\s*rate)\s*[:=]\s*([\d.]+)", text, re.IGNORECASE)
     dur    = re.search(r"duration\s*[:=]\s*([^|\n\r]+)", text, re.IGNORECASE)
 
-    # Report links — keyword match on URL path first, then label-based fallback
+    # Report links — strategy 1: keyword present in the URL path itself
     links      = _extract_links(f"{plain_text}\n{markdown_text}\n{html_payload}")
-    karate_url = next((l for l in links if "karate"     in l), "")
+    karate_url = next((l for l in links if "karate"     in l.lower()), "")
     clue_url   = next((l for l in links if "cluecumber" in l.lower()), "")
-    cuke_url   = next((l for l in links if "cucumber"   in l.lower() and "karate" not in l), "")
+    cuke_url   = next((l for l in links if "cucumber"   in l.lower() and "karate" not in l.lower()), "")
     pipeline_link = _extract_with_aliases(text, ["Pipeline Link", "Pipeline", "Pipeline URL"])
     job_link = _extract_with_aliases(text, ["Job Link", "Job URL"])
 
-    # Supplement with label-based extraction from Webex HTML payload
-    labeled = _parse_labeled_links_from_html(html_payload)
+    # Strategy 2: label-based extraction from Webex HTML anchor tags
+    labeled_html = _parse_labeled_links_from_html(html_payload)
     if not karate_url:
-        karate_url = labeled.get("karate_url", "")
+        karate_url = labeled_html.get("karate_url", "")
     if not clue_url:
-        clue_url = labeled.get("cluecumber_url", "")
+        clue_url = labeled_html.get("cluecumber_url", "")
     if not cuke_url:
-        cuke_url = labeled.get("cucumber_url", "")
+        cuke_url = labeled_html.get("cucumber_url", "")
     if not pipeline_link:
-        pipeline_link = labeled.get("pipeline_url", "")
-    job_link = job_link or labeled.get("job_url", "")
+        pipeline_link = labeled_html.get("pipeline_url", "")
+    job_link = job_link or labeled_html.get("job_url", "")
+
+    # Strategy 3: label-based extraction from plain text / Markdown
+    # (handles "Karate Report: https://...", "**Cluecumber**: https://..." etc.)
+    labeled_text = _parse_labeled_links_from_text(f"{plain_text}\n{markdown_text}")
+    if not karate_url:
+        karate_url = labeled_text.get("karate_url", "")
+    if not clue_url:
+        clue_url = labeled_text.get("cluecumber_url", "")
+    if not cuke_url:
+        cuke_url = labeled_text.get("cucumber_url", "")
+    if not pipeline_link:
+        pipeline_link = labeled_text.get("pipeline_url", "")
+    job_link = job_link or labeled_text.get("job_url", "")
+
+    # Strategy 4: positional fallback — assign the first three unclassified
+    # HTTP links to Karate / Cluecumber / Cucumber in order of appearance when
+    # none of the label strategies matched them (common when the message uses
+    # generic CI artifact URLs without keywords in the path).
+    unclassified = [
+        l for l in links
+        if l not in {karate_url, clue_url, cuke_url, pipeline_link, job_link}
+        and l.startswith("http")
+    ]
+    if not karate_url and unclassified:
+        karate_url = unclassified.pop(0)
+    if not clue_url and unclassified:
+        clue_url = unclassified.pop(0)
+    if not cuke_url and unclassified:
+        cuke_url = unclassified.pop(0)
 
     return {
         "message_id":       msg["id"],
