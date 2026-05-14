@@ -1002,7 +1002,7 @@ def run():
     # Determine after_dt from CLI flags or interactive menu
     if args.days is not None:
         if args.days <= 0:
-            raise RuntimeError("--days must be greater than zero.")
+            raise RuntimeError("--days must be at least 1.")
         after_dt = (datetime.now(timezone.utc) - timedelta(days=args.days)).replace(
             hour=0, minute=0, second=0, microsecond=0)
         range_key = f"{args.days}days"
