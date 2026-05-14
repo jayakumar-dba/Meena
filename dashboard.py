@@ -92,6 +92,9 @@ TEMPLATE = """
 <nav class="navbar" style="padding:12px 20px">
   <span class="fw-bold fs-5">🧪 Regression Quality Board</span>
   <span class="small ms-auto" style="opacity:.92">{{ total }} total runs in database</span>
+  {% if active_collection_window %}
+  <span class="small ms-3" style="opacity:.92">Active collection window: {{ active_collection_window }}</span>
+  {% endif %}
 </nav>
 
 <!-- Filters -->
@@ -112,6 +115,11 @@ TEMPLATE = """
     <select id="env" name="env" class="form-select form-select-sm focus-ring" style="width:auto">
       <option value="">All Envs</option>
       {% for e in envs %}<option {{'selected' if filters.env==e}}>{{e}}</option>{% endfor %}
+    </select>
+    <label class="small fw-semibold" for="report_date">Report Date</label>
+    <select id="report_date" name="report_date" class="form-select form-select-sm focus-ring" style="width:auto">
+      <option value="">All dates in collection window</option>
+      {% for d in report_dates %}<option value="{{d}}" {{'selected' if filters.report_date==d}}>{{d}}</option>{% endfor %}
     </select>
     <button class="btn btn-sm btn-primary focus-ring">Apply</button>
     <a href="/" class="btn btn-sm btn-outline-secondary focus-ring">Reset</a>
@@ -288,18 +296,54 @@ def index():
     days   = int(request.args.get("days", 7))
     app_f  = request.args.get("app", "")
     env_f  = request.args.get("env", "")
-    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    report_date_f = request.args.get("report_date", "")
+    has_collection_runs = bool(
+        query("SELECT name FROM sqlite_master WHERE type='table' AND name='collection_runs'")
+    )
+    latest_run = None
+    if has_collection_runs:
+        latest_run_rows = query("""
+            SELECT run_started_at, range_type, from_date, to_date
+            FROM collection_runs
+            ORDER BY datetime(run_started_at) DESC, id DESC
+            LIMIT 1
+        """)
+        latest_run = latest_run_rows[0] if latest_run_rows else None
 
-    where  = ["r.executed_at >= ?"]
-    params = [cutoff]
+    active_collection_window = ""
+    if latest_run:
+        from_date = latest_run["from_date"] or ""
+        to_date = latest_run["to_date"] or ""
+        range_type = latest_run["range_type"] or ""
+        active_collection_window = f"{range_type}: {from_date} → {to_date}" if from_date and to_date else range_type
+        base_where = ["date(r.executed_at) BETWEEN ? AND ?"]
+        base_params = [from_date, to_date]
+    else:
+        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        base_where = ["r.executed_at >= ?"]
+        base_params = [cutoff]
+
+    where  = list(base_where)
+    params = list(base_params)
     if app_f: where.append("r.application = ?"); params.append(app_f)
     if env_f: where.append("r.env = ?");         params.append(env_f)
+    if report_date_f:
+        where.append("date(r.executed_at) = ?")
+        params.append(report_date_f)
     sql_where = " AND ".join(where)
+    base_sql_where = " AND ".join(base_where)
 
     reports    = query(f"SELECT * FROM reports r WHERE {sql_where} ORDER BY r.executed_at DESC", params)
     total      = query("SELECT COUNT(*) as c FROM reports")[0]["c"]
-    apps       = [r["application"] for r in query("SELECT DISTINCT application FROM reports WHERE application != ''")]
-    envs       = [r["env"]         for r in query("SELECT DISTINCT env FROM reports WHERE env != ''")]
+    apps       = [r["application"] for r in query(f"SELECT DISTINCT application FROM reports r WHERE {base_sql_where} AND application != ''", base_params)]
+    envs       = [r["env"]         for r in query(f"SELECT DISTINCT env FROM reports r WHERE {base_sql_where} AND env != ''", base_params)]
+    report_dates = [
+        r["report_date"]
+        for r in query(
+            f"SELECT DISTINCT date(r.executed_at) as report_date FROM reports r WHERE {base_sql_where} ORDER BY report_date DESC",
+            base_params,
+        )
+    ]
 
     kpi_rows   = query(f"SELECT * FROM reports r WHERE {sql_where}", params)
     runs       = len(kpi_rows)
@@ -388,7 +432,9 @@ def index():
         recurring_threshold=RECURRING_FAILURE_THRESHOLD,
         feature_name_max=FEATURE_NAME_MAX,
         failure_reason_max=FAILURE_REASON_MAX,
-        filters=dict(days=days, app=app_f, env=env_f),
+        report_dates=report_dates,
+        active_collection_window=active_collection_window,
+        filters=dict(days=days, app=app_f, env=env_f, report_date=report_date_f),
     )
 
 
