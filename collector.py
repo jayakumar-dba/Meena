@@ -128,6 +128,7 @@ def init_db():
             scenario_name TEXT,
             failure_line  TEXT,
             failure_reason TEXT,
+            ai_fix_idea   TEXT,
             FOREIGN KEY(report_id) REFERENCES reports(id)
         )
     """)
@@ -143,6 +144,9 @@ def init_db():
     report_columns = {row[1] for row in con.execute("PRAGMA table_info(reports)")}
     if "collection_run_id" not in report_columns:
         con.execute("ALTER TABLE reports ADD COLUMN collection_run_id INTEGER")
+    failure_columns = {row[1] for row in con.execute("PRAGMA table_info(failures)")}
+    if "ai_fix_idea" not in failure_columns:
+        con.execute("ALTER TABLE failures ADD COLUMN ai_fix_idea TEXT")
     con.execute("CREATE INDEX IF NOT EXISTS idx_reports_executed_at ON reports(executed_at)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_reports_app_env ON reports(application, env)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_reports_collection_run_id ON reports(collection_run_id)")
@@ -935,19 +939,28 @@ def save_report(data, failures=None):
         ).fetchone()[0]
         con.execute("DELETE FROM failures WHERE report_id=?", (report_id,))
         if failures:
-            con.executemany("""
-                INSERT INTO failures (report_id, feature_file, scenario_name, failure_line, failure_reason)
-                VALUES (?, ?, ?, ?, ?)
-            """, [
-                (
-                    report_id,
-                    f.get("feature_file", ""),
-                    f.get("scenario_name", ""),
-                    f.get("failure_line", ""),
-                    f.get("failure_reason", "")
+            meaningful = [
+                f for f in failures
+                if any(
+                    f.get(k)
+                    for k in ("feature_file", "scenario_name", "failure_line", "failure_reason")
                 )
-                for f in failures
-            ])
+            ]
+            if meaningful:
+                con.executemany("""
+                    INSERT INTO failures (report_id, feature_file, scenario_name, failure_line, failure_reason, ai_fix_idea)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, [
+                    (
+                        report_id,
+                        f.get("feature_file", ""),
+                        f.get("scenario_name", ""),
+                        f.get("failure_line", ""),
+                        f.get("failure_reason", ""),
+                        f.get("ai_fix_idea", ""),
+                    )
+                    for f in meaningful
+                ])
         con.commit()
         return report_id
     finally:
