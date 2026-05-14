@@ -6,6 +6,7 @@ Usage:
     Then open: http://localhost:5000
 """
 
+import re
 import sqlite3
 from flask import Flask, render_template_string, request
 from datetime import datetime, timedelta
@@ -15,6 +16,8 @@ DB_FILE = "regression.db"
 RECURRING_FAILURE_THRESHOLD = 3
 FEATURE_NAME_MAX = 24
 FAILURE_REASON_MAX = 80
+JOB_FILTER_VALUES = ["resi", "smb", "cht"]
+JOB_NAME_DISPLAY_MAX = 25
 
 
 def query(sql, params=()):
@@ -63,7 +66,9 @@ TEMPLATE = """
     .pill-pass { background:#e9f7ef; color:var(--pass); }
     .pill-warn { background:#fff1da; color:var(--warn); }
     .pill-info { background:#e8eeff; color:#2948c6; }
-    .table td { vertical-align:top; }
+    .table td { vertical-align:middle; }
+    .table th { vertical-align:middle; white-space:nowrap; }
+    .fix-idea { color:#6b21a8; font-style:italic; font-size:.72rem; }
     .legend-dot { width:10px; height:10px; border-radius:50%; display:inline-block; margin-right:6px; }
     .focus-ring:focus-visible, a:focus-visible, button:focus-visible, select:focus-visible {
       outline: 3px solid var(--focus);
@@ -115,6 +120,11 @@ TEMPLATE = """
     <select id="env" name="env" class="form-select form-select-sm focus-ring" style="width:auto">
       <option value="">All Envs</option>
       {% for e in envs %}<option {{'selected' if filters.env==e}}>{{e}}</option>{% endfor %}
+    </select>
+    <label class="small fw-semibold" for="job">Job</label>
+    <select id="job" name="job" class="form-select form-select-sm focus-ring" style="width:auto">
+      <option value="">All Jobs</option>
+      {% for j in job_filter_values %}<option value="{{j}}" {{'selected' if filters.job==j}}>{{j}}</option>{% endfor %}
     </select>
     <label class="small fw-semibold" for="report_date">Report Date</label>
     <select id="report_date" name="report_date" class="form-select form-select-sm focus-ring" style="width:auto">
@@ -199,33 +209,37 @@ TEMPLATE = """
           <th scope="col">Application</th>
           <th scope="col">Environment</th>
           <th scope="col">DS Row</th>
-          <th scope="col">Job Name</th>
+          <th scope="col">Job</th>
           <th scope="col">Passed</th>
           <th scope="col">Failed</th>
           <th scope="col">Failure Feature File</th>
           <th scope="col">Failure Line</th>
           <th scope="col">Failure Reason</th>
+          <th scope="col">Fix ideas from AI</th>
           <th scope="col">Report Links</th>
           <th scope="col">Weekly Recurrence</th>
         </tr></thead>
         <tbody>
         {% for r in failure_rows %}
         <tr>
-          <td class="small">{{r['executed_at'][:16].replace('T',' ')}}</td>
-          <td><strong>{{r['application']}}</strong></td>
+          <td class="small text-nowrap">{{r['executed_at'][:16].replace('T',' ')}}</td>
+          <td><strong>{{r['application_display']}}</strong></td>
           <td><span class="pill pill-info">{{r['env']}}</span></td>
-          <td class="text-center">{{r['ds_row']}}</td>
-          <td class="small text-muted" title="{{r['job_name']}}">
-            {{r['job_name'][:25]}}{{'…' if r['job_name'] and r['job_name']|length>25 else ''}}
+          <td class="text-center small">{{r['ds_row']}}</td>
+          <td class="small text-muted text-nowrap" title="{{r['job_name']}}">
+            {{r['job_display']}}
           </td>
-          <td class="pass">{{r['scenarios_passed']}}</td>
-          <td class="{{'fail' if r['scenarios_failed']>0 else 'pass'}}">
+          <td class="pass text-center">{{r['scenarios_passed']}}</td>
+          <td class="text-center {{'fail' if r['scenarios_failed']>0 else 'pass'}}">
             <strong>{{r['scenarios_failed']}}</strong>
           </td>
           <td class="small">{{r['feature_file'] if r['feature_file'] else '—'}}</td>
           <td class="small text-center">{{r['failure_line'] if r['failure_line'] else '—'}}</td>
           <td class="small" title="{{r['failure_reason']}}">
             {{r['failure_reason'][:failure_reason_max] if r['failure_reason'] else '—'}}{{'…' if r['failure_reason'] and r['failure_reason']|length>failure_reason_max else ''}}
+          </td>
+          <td class="small fix-idea">
+            {{r['ai_fix_idea'] if r['ai_fix_idea'] else '—'}}
           </td>
           <td class="small">
             {% set report_links = [
@@ -244,7 +258,7 @@ TEMPLATE = """
             {% endfor %}
             {% if not has_link.value %}<span class="text-muted">—</span>{% endif %}
           </td>
-          <td>
+          <td class="text-center">
             {% if r['weekly_recurrence'] %}
               <span class="pill {{'pill-fail' if r['weekly_recurrence'] >= recurring_threshold else 'pill-warn'}}">{{r['weekly_recurrence']}}x</span>
             {% else %}
@@ -254,7 +268,7 @@ TEMPLATE = """
         </tr>
         {% else %}
         <tr>
-          <td colspan="12" class="text-center text-muted py-4">
+          <td colspan="13" class="text-center text-muted py-4">
             No data found. Run <code>python3 collector.py</code> first.
           </td>
         </tr>
@@ -296,6 +310,7 @@ def index():
     days   = int(request.args.get("days", 7))
     app_f  = request.args.get("app", "")
     env_f  = request.args.get("env", "")
+    job_f  = request.args.get("job", "")
     report_date_f = request.args.get("report_date", "")
     has_collection_runs = bool(
         query("SELECT name FROM sqlite_master WHERE type='table' AND name='collection_runs'")
@@ -327,6 +342,7 @@ def index():
     params = list(base_params)
     if app_f: where.append("r.application = ?"); params.append(app_f)
     if env_f: where.append("r.env = ?");         params.append(env_f)
+    if job_f: where.append("LOWER(r.job_name) LIKE ?"); params.append(f"%{job_f.lower()}%")
     if report_date_f:
         where.append("date(r.executed_at) = ?")
         params.append(report_date_f)
@@ -399,6 +415,7 @@ def index():
             f.feature_file,
             f.failure_line,
             f.failure_reason,
+            COALESCE(f.ai_fix_idea, '') as ai_fix_idea,
             COALESCE(w.weekly_recurrence, 0) as weekly_recurrence
         FROM reports r
         LEFT JOIN failures f ON f.report_id = r.id
@@ -417,6 +434,18 @@ def index():
                 r[f"{key}_safe"] = value
             else:
                 r[f"{key}_safe"] = ""
+        # Simplify application display: strip any " (triggered by ...)" suffix
+        app_raw = r.get("application") or ""
+        r["application_display"] = re.split(r"\s*\(\s*triggered", app_raw, flags=re.IGNORECASE)[0].strip() or app_raw
+        # Job display: show only the short env token (resi/smb/cht) when present,
+        # otherwise fall back to the full job_name (truncated).
+        job_raw = r.get("job_name") or ""
+        job_token = ""
+        for token in JOB_FILTER_VALUES:
+            if token.lower() in job_raw.lower():
+                job_token = token
+                break
+        r["job_display"] = job_token if job_token else (job_raw[:JOB_NAME_DISPLAY_MAX] + ("…" if len(job_raw) > JOB_NAME_DISPLAY_MAX else ""))
         processed_failure_rows.append(r)
 
     return render_template_string(
@@ -434,7 +463,8 @@ def index():
         failure_reason_max=FAILURE_REASON_MAX,
         report_dates=report_dates,
         active_collection_window=active_collection_window,
-        filters=dict(days=days, app=app_f, env=env_f, report_date=report_date_f),
+        job_filter_values=JOB_FILTER_VALUES,
+        filters=dict(days=days, app=app_f, env=env_f, job=job_f, report_date=report_date_f),
     )
 
 
