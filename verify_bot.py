@@ -8,13 +8,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN = os.getenv("WEBEX_BOT_TOKEN")
+TOKEN = os.getenv("WEBEX_TOKEN") or os.getenv("WEBEX_ACCESS_TOKEN") or os.getenv("WEBEX_BOT_TOKEN")
 
-rooms = requests.get(
+if not TOKEN:
+    raise SystemExit("❌ Missing Webex token. Set WEBEX_TOKEN or WEBEX_ACCESS_TOKEN (WEBEX_BOT_TOKEN is also supported).")
+
+response = requests.get(
     "https://webexapis.com/v1/rooms",
     headers={"Authorization": f"Bearer {TOKEN}"},
-    params={"max": 20}
-).json().get("items", [])
+    params={"max": 20},
+    timeout=15,
+)
+if response.status_code == 401:
+    raise SystemExit("❌ Webex token is invalid/expired (401 Unauthorized).")
+response.raise_for_status()
+rooms = response.json().get("items", [])
 
 print("\n✅ Bot can see these rooms:")
 print("-" * 70)

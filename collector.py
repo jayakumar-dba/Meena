@@ -32,10 +32,13 @@ except ImportError:  # pragma: no cover
 
 load_dotenv()
 
-WEBEX_TOKEN = os.getenv("WEBEX_BOT_TOKEN")
+WEBEX_TOKEN = (
+    os.getenv("WEBEX_TOKEN")
+    or os.getenv("WEBEX_ACCESS_TOKEN")
+    or os.getenv("WEBEX_BOT_TOKEN")
+)
 ROOM_ID     = os.getenv("WEBEX_ROOM_ID")
 DB_FILE     = "regression.db"
-HEADERS     = {"Authorization": f"Bearer {WEBEX_TOKEN}"}
 FAILURE_PATTERN = r"(fail|error|exception|assert|expected|mismatch|timeout)"
 FAILURE_REASON_SEARCH_WINDOW = 8
 MAX_FAILURE_REASON_LENGTH = 500
@@ -128,10 +131,24 @@ def init_db():
             FOREIGN KEY(report_id) REFERENCES reports(id)
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS collection_runs (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_started_at TEXT,
+            range_type     TEXT,
+            from_date      TEXT,
+            to_date        TEXT
+        )
+    """)
+    report_columns = {row[1] for row in con.execute("PRAGMA table_info(reports)")}
+    if "collection_run_id" not in report_columns:
+        con.execute("ALTER TABLE reports ADD COLUMN collection_run_id INTEGER")
     con.execute("CREATE INDEX IF NOT EXISTS idx_reports_executed_at ON reports(executed_at)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_reports_app_env ON reports(application, env)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_reports_collection_run_id ON reports(collection_run_id)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_failures_report_id ON failures(report_id)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_failures_feature_reason ON failures(feature_file, failure_reason)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_collection_runs_started_at ON collection_runs(run_started_at)")
     con.commit()
     con.close()
     print("✅ Database ready.")
@@ -197,6 +214,40 @@ def choose_date_range() -> tuple:
 
 # ── Webex polling ─────────────────────────────────────────────────────────────
 
+def _webex_headers() -> dict:
+    if not WEBEX_TOKEN:
+        raise RuntimeError(
+            "Webex token is missing. Set WEBEX_TOKEN or WEBEX_ACCESS_TOKEN "
+            "(WEBEX_BOT_TOKEN is also supported for backward compatibility)."
+        )
+    return {"Authorization": f"Bearer {WEBEX_TOKEN}"}
+
+
+def _raise_for_webex_http_error(response: requests.Response, action: str) -> None:
+    if response.status_code == 401:
+        raise RuntimeError(
+            f"Webex authentication failed while {action} (401 Unauthorized). "
+            "Your token is invalid/expired, or this token does not have access to the room."
+        )
+    response.raise_for_status()
+
+
+def validate_webex_setup() -> None:
+    _webex_headers()  # fail fast when token is missing
+    if not ROOM_ID:
+        raise RuntimeError("WEBEX_ROOM_ID is missing. Set WEBEX_ROOM_ID in your environment or .env file.")
+
+    me = requests.get("https://webexapis.com/v1/people/me", headers=_webex_headers(), timeout=15)
+    _raise_for_webex_http_error(me, "validating Webex token")
+
+    room = requests.get(f"https://webexapis.com/v1/rooms/{ROOM_ID}", headers=_webex_headers(), timeout=15)
+    if room.status_code in {401, 403, 404}:
+        raise RuntimeError(
+            "Webex room access validation failed. Confirm WEBEX_ROOM_ID is correct and the token has room access."
+        )
+    room.raise_for_status()
+
+
 def fetch_messages(after_dt: Optional[datetime] = None, page_size: int = 200) -> List[dict]:
     """Fetch Webex room messages, optionally limited to those created on/after *after_dt*.
 
@@ -220,8 +271,8 @@ def fetch_messages(after_dt: Optional[datetime] = None, page_size: int = 200) ->
         if before_message_id:
             params["beforeMessage"] = before_message_id
 
-        r = requests.get(url, headers=HEADERS, params=params)
-        r.raise_for_status()
+        r = requests.get(url, headers=_webex_headers(), params=params, timeout=30)
+        _raise_for_webex_http_error(r, "fetching Webex messages")
         page = r.json().get("items", [])
 
         if not page:
@@ -862,6 +913,8 @@ def parse_message(msg):
 # ── Save to DB ────────────────────────────────────────────────────────────────
 
 def save_report(data, failures=None):
+    data = dict(data)
+    data.setdefault("collection_run_id", None)
     con = sqlite3.connect(DB_FILE)
     try:
         con.execute("""
@@ -869,12 +922,12 @@ def save_report(data, failures=None):
             (message_id, executed_at, application, env, job_name, ds_row,
              source_branch, triggered_by, pipeline_id, job_id,
              scenarios_passed, scenarios_failed, pass_percent, duration,
-             karate_url, cluecumber_url, cucumber_url)
+             karate_url, cluecumber_url, cucumber_url, collection_run_id)
             VALUES
             (:message_id, :executed_at, :application, :env, :job_name, :ds_row,
              :source_branch, :triggered_by, :pipeline_id, :job_id,
              :scenarios_passed, :scenarios_failed, :pass_percent, :duration,
-             :karate_url, :cluecumber_url, :cucumber_url)
+             :karate_url, :cluecumber_url, :cucumber_url, :collection_run_id)
         """, data)
         con.commit()
         report_id = con.execute(
@@ -948,17 +1001,39 @@ def run():
 
     # Determine after_dt from CLI flags or interactive menu
     if args.days is not None:
+        if args.days <= 0:
+            raise RuntimeError("--days must be at least 1.")
         after_dt = (datetime.now(timezone.utc) - timedelta(days=args.days)).replace(
             hour=0, minute=0, second=0, microsecond=0)
+        range_key = f"{args.days}days"
         label = f"last {args.days} day(s)"
     elif args.range is not None:
+        range_key = args.range
         after_dt = _after_dt_for_range(args.range)
         label = _RANGE_CHOICES[args.range]
     else:
-        _, after_dt = choose_date_range()
+        range_key, after_dt = choose_date_range()
         label = f"since {after_dt.strftime('%Y-%m-%d')}"
 
+    validate_webex_setup()
     init_db()
+
+    run_started_at = datetime.now(timezone.utc)
+    to_dt = run_started_at
+    from_date = after_dt.date().isoformat()
+    to_date = to_dt.date().isoformat()
+
+    con = sqlite3.connect(DB_FILE)
+    cur = con.execute(
+        """
+        INSERT INTO collection_runs (run_started_at, range_type, from_date, to_date)
+        VALUES (?, ?, ?, ?)
+        """,
+        (run_started_at.isoformat(), range_key, from_date, to_date),
+    )
+    collection_run_id = cur.lastrowid
+    con.commit()
+    con.close()
 
     print(f"📡 Fetching Webex messages ({label})…")
     messages = fetch_messages(after_dt=after_dt)
@@ -978,6 +1053,7 @@ def run():
         data = parse_message(msg)
         if data:
             parsed += 1
+            data["collection_run_id"] = collection_run_id
             failures = []
             if data["scenarios_failed"] > 0:
                 failures = extract_failures_for_report(data, msg)
@@ -992,4 +1068,8 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    try:
+        run()
+    except RuntimeError as exc:
+        print(f"\n❌ {exc}")
+        raise SystemExit(1)
